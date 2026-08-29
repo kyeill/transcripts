@@ -27,6 +27,13 @@ from difflib import SequenceMatcher
 # aside - which can be long too, but aren't what gets said word-for-word
 _SCRIPTURE_REF_RE = re.compile(r"\b(?:[1-3]\s?)?[A-Z][a-z]+\.?\s+\d{1,3}\s?:\s?\d{1,3}")
 
+# Items whose printed body is scripture but is NEVER read aloud - it's there
+# for the congregation to read silently. Anchoring on these is guaranteed to
+# be a false match: there is no audio for the text to match against, so the
+# fuzzy search just pins whatever nearby speech scores least badly, and every
+# later anchor inherits the error via the search cursor.
+NEVER_SPOKEN_LABELS = {"Silent meditation"}
+
 # rough seconds, used only to split time between two anchors when the
 # items in between have no reference text to match against
 DURATION_PRIORS = {
@@ -53,9 +60,19 @@ DURATION_PRIORS = {
 DEFAULT_PRIOR = 90
 
 MIN_ANCHOR_TEXT_LEN = 30
-MIN_ANCHOR_RATIO = 0.4
+# A genuinely read-aloud passage scores well above this against its printed
+# text once digits are normalised away. 0.4 was far too permissive - on prose
+# of similar length almost anything clears it, so false anchors were being
+# accepted and then propagated by the search cursor.
+MIN_ANCHOR_RATIO = 0.6
 ANCHOR_LOOKAHEAD = 250  # segments to search ahead of the cursor
 MAX_ANCHOR_SPAN = 80  # max segments an anchor can span
+
+
+def _normalise(text):
+    """Printed scripture carries verse numbers that are never read aloud;
+    drop digits from both sides so they don't depress a true match's score."""
+    return re.sub(r"\d+", " ", text.lower())
 
 
 @dataclass
@@ -77,7 +94,7 @@ def _find_anchor(item_text, segments, cursor):
         text = ""
         for j in range(i, min(i + MAX_ANCHOR_SPAN, len(segments))):
             text = (text + " " + segments[j]["text"]).strip()
-            ratio = SequenceMatcher(None, text.lower(), item_text.lower()).ratio()
+            ratio = SequenceMatcher(None, _normalise(text), _normalise(item_text)).ratio()
             if best is None or ratio > best[0]:
                 best = (ratio, i, j)
             if len(text) > len(item_text) * 1.5:
@@ -89,6 +106,8 @@ def _is_anchor_eligible(item):
     """Song lyrics are always sung close to verbatim. For speech, only a
     printed scripture quotation is - a bulletin note or sermon outline can
     also be long, but isn't what actually gets said word-for-word."""
+    if item.label in NEVER_SPOKEN_LABELS:
+        return False
     if item.kind == "music":
         return len(item.text) >= MIN_ANCHOR_TEXT_LEN
     if len(item.text) < MIN_ANCHOR_TEXT_LEN:
