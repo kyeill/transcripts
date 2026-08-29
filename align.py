@@ -50,7 +50,12 @@ DURATION_PRIORS = {
     "Prayer of confession": 90,
     "Declaration of forgiveness": 30,
     "Scripture reading": 120,
-    "Sermon": 1800,
+    # Measured ~44min on 2026-08-23 including the closing prayer. This one
+    # matters more than the rest: the document ends at the sermon, so setting
+    # it short silently drops the end of the sermon and the prayer, while
+    # setting it long only spills a little of the following song - which
+    # renders as a title, not text. When in doubt, err long.
+    "Sermon": 2400,
     "Prayer": 60,
     "Living out our faith": 180,
     "Missionary Greeting": 240,

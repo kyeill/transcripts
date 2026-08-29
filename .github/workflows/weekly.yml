@@ -17,7 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
-      WHISPER_MODEL: medium
+      # large-v3 is the most accurate model; it costs roughly 2-3x medium's CPU
+      # time, which is affordable here - the job has a 4h ceiling, the document
+      # now stops at the sermon, and a weekly run that is slower but better is
+      # the right trade.
+      WHISPER_MODEL: large-v3
     steps:
       - uses: actions/checkout@v5
 

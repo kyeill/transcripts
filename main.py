@@ -1,16 +1,67 @@
 import argparse
 import json
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 
 from fetch_episode import episode_assets, latest_episode_url
 from worship_guide import parse_worship_guide
-from transcribe import transcribe
 from align import align
 from render import render
 
+# transcribe is imported inside run(): it pulls in faster-whisper, which has no
+# Windows-ARM64 wheel, and importing it at module level would make this file
+# unimportable on Kyle's machine even for the parts that need no transcription.
+
 OUTPUT_DIR = "output"
+
+# The document stops once the sermon is over. What follows is the closing
+# prayer and a song, then announcements and the missionary greeting, none of
+# which Kyle wants transcribed. The whole service is still aligned first: the
+# sermon's end is only known from where the next item starts, and the closing
+# prayer is not a separate line in the guide, so it stays inside the sermon.
+LAST_LABEL = "Sermon"
+
+
+_AMEN_RE = re.compile(r"\bamen\b", re.I)
+CLOSING_PRAYER_LOOKAHEAD = 600  # seconds past the sermon to look for its "amen"
+
+
+def through_sermon(blocks):
+    for i in range(len(blocks) - 1, -1, -1):
+        if blocks[i].label == LAST_LABEL:
+            return blocks[: i + 1]
+    return blocks  # no sermon found - keep everything rather than emit nothing
+
+
+def extend_to_closing_amen(blocks, segments):
+    """Run the final block on to the end of the sermon's closing prayer.
+
+    The guide gives that prayer no line of its own, so it belongs to the
+    sermon - but the song after it is sung over accompaniment and so leaves no
+    silence, and with nothing in the audio marking the change the search tends
+    to end the sermon a few minutes early. A prayer ends on "amen", which is a
+    dependable close, so the block is extended to the first one after it and
+    cut there - which also leaves the song's opening line out.
+    """
+    if not blocks or not segments or blocks[-1].kind != "speech":
+        return blocks
+
+    last = blocks[-1]
+    limit = last.end + CLOSING_PRAYER_LOOKAHEAD
+    trailing = []
+    for segment in segments:
+        if segment["end"] <= last.end or segment["start"] > limit:
+            continue
+        found = _AMEN_RE.search(segment["text"])
+        if found:
+            trailing.append(segment["text"][: found.end()])
+            last.text = " ".join([last.text, *trailing]).strip()
+            last.end = segment["end"]
+            break
+        trailing.append(segment["text"])
+    return blocks  # no "amen" in range - leave the boundary where the search put it
 
 
 def run(episode_url=None):
@@ -41,6 +92,8 @@ def run(episode_url=None):
 
     print(f"parsed {len(items)} order-of-service items")
 
+    from transcribe import transcribe
+
     segments, audio_duration = transcribe(audio_url)
     print(f"transcribed {len(segments)} segments across {audio_duration / 60:.1f} min")
 
@@ -54,7 +107,9 @@ def run(episode_url=None):
     with open(os.path.join(OUTPUT_DIR, f"{slug}.segments.json"), "w", encoding="utf-8") as f:
         json.dump({"duration": audio_duration, "segments": segments}, f, indent=1)
 
-    blocks = align(items, segments, audio_duration=audio_duration)
+    blocks = through_sermon(align(items, segments, audio_duration=audio_duration))
+    blocks = extend_to_closing_amen(blocks, segments)
+    print(f"keeping {len(blocks)} sections, through the end of the {LAST_LABEL.lower()}")
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     render(title, date_str, blocks, out_path)
