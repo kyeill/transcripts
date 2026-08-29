@@ -2,3 +2,4 @@ playwright
 requests
 pypdf
 python-docx
+faster-whisper
