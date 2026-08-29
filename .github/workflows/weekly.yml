@@ -30,6 +30,14 @@ jobs:
 
       - run: python main.py
 
+      - name: keep the raw transcript for offline alignment tuning
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-transcript
+          path: output/*.segments.json
+          if-no-files-found: ignore
+
       - name: commit transcript if one was produced
         run: |
           git config user.name "github-actions[bot]"

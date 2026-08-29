@@ -5,3 +5,8 @@ cache/
 *.mp3
 *.m4a
 .venv/
+
+# raw transcripts are diagnostic working data, published as build artifacts
+# rather than committed - they still contain the sung sections, which the
+# finished document deliberately leaves out
+output/*.segments.json
