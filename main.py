@@ -41,8 +41,8 @@ def run(episode_url=None):
 
     print(f"parsed {len(items)} order-of-service items")
 
-    segments = transcribe(audio_url)
-    print(f"transcribed {len(segments)} segments")
+    segments, audio_duration = transcribe(audio_url)
+    print(f"transcribed {len(segments)} segments across {audio_duration / 60:.1f} min")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     # Diagnostic dump of the raw timestamped transcript. Transcription is the
@@ -52,9 +52,9 @@ def run(episode_url=None):
     # and published as a build artifact instead: it is working data, not a
     # deliverable, and unlike the document it still contains the sung sections.
     with open(os.path.join(OUTPUT_DIR, f"{slug}.segments.json"), "w", encoding="utf-8") as f:
-        json.dump(segments, f, indent=1)
+        json.dump({"duration": audio_duration, "segments": segments}, f, indent=1)
 
-    blocks = align(items, segments)
+    blocks = align(items, segments, audio_duration=audio_duration)
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     render(title, date_str, blocks, out_path)

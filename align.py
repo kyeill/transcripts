@@ -6,16 +6,21 @@ garbled sung lyrics.
 Three passes:
 
 1. Anchor pass - a few guide items print text that is genuinely performed
-   word-for-word (scripture read aloud, a song whose full lyrics are given).
-   Each is fuzzy-matched against the whole transcript to pin exact times.
+   word-for-word (scripture read aloud). Each is fuzzy-matched against the
+   whole transcript to pin exact times.
 2. Consistency pass - the chosen anchors must run in the same order as the
    guide, so a single bad match can't drag everything after it out of place.
-3. Fill pass - everything else (prayers, the sermon, announcements, hymns
-   cited only by number) has no text to match on, so its boundaries are cut
-   at real silences in the audio, guided by rough per-label duration priors.
+3. Fill pass - everything else has no text to match on, so its boundaries
+   come from where the audio is talking versus where it is quiet.
+
+The fill pass leans on a quirk of the transcriber: whisper's voice-activity
+filter drops singing almost entirely, so a hymn appears as a long silence.
+Music therefore belongs in the silences and speech in the talking, which is a
+far stronger signal than guessing how long anything ought to run.
 
 Segments are then bucketed into whichever item's window contains them.
 """
+import bisect
 import math
 import re
 from dataclasses import dataclass, field
@@ -32,12 +37,12 @@ _SCRIPTURE_REF_RE = re.compile(r"\b(?:[1-3]\s?)?[A-Z][a-z]+\.?\s+\d{1,3}\s?:\s?\
 # fuzzy search just pins whatever nearby speech scores least badly.
 NEVER_SPOKEN_LABELS = {"Silent meditation"}
 
-# rough seconds, used to keep the silence-cut boundaries plausible when
-# several items share one gap between anchors
+# rough seconds; only used to keep results plausible where the audio itself
+# doesn't settle the question
 DURATION_PRIORS = {
-    "Prelude": 120,
+    "Prelude": 300,
     "Welcome": 90,
-    "Silent meditation": 60,
+    "Silent meditation": 30,
     "Call to Worship": 60,
     "Song": 240,
     "Invocation": 60,
@@ -45,15 +50,15 @@ DURATION_PRIORS = {
     "Prayer of confession": 90,
     "Declaration of forgiveness": 30,
     "Scripture reading": 120,
-    "Sermon": 2100,
+    "Sermon": 1800,
     "Prayer": 60,
     "Living out our faith": 180,
-    "Missionary Greeting": 180,
+    "Missionary Greeting": 240,
     "Prayers of the People": 240,
     "Offertory": 240,
     "Doxology": 60,
     "Benediction": 60,
-    "Postlude": 90,
+    "Postlude": 120,
 }
 DEFAULT_PRIOR = 90
 
@@ -69,8 +74,16 @@ MIN_ANCHOR_RATIO = 0.6
 MAX_ANCHOR_SPAN = 80  # max segments one anchor may span
 
 MIN_GAP_SECONDS = 0.6  # a pause has to be this long to be a boundary candidate
-GAP_REWARD = 2.0  # how much a big silence outweighs an off-prior duration
-GAP_SATURATION = 8.0  # seconds beyond which a longer pause is no better
+MAX_CANDIDATES = 70  # clearest pauses per region, to bound the search
+# Grid spacing has to stay fine. A coarse grid leaves the final minutes with
+# no boundary at all, and the closing hymn and postlude - which follow the
+# last spoken word and so create no pause of their own - then have nowhere to
+# sit, which drags every earlier item out of position.
+GRID_STEP_SECONDS = 20.0
+MAX_GRID_POINTS = 240
+# How strongly to insist that music lands on silence and speech on talking.
+# Set well above the duration priors: the priors are guesses, this is measured.
+TYPE_WEIGHT = 6.0
 
 
 @dataclass
@@ -88,6 +101,11 @@ def _normalise(text):
     """Printed scripture carries verse numbers that are never read aloud;
     drop digits from both sides so they don't depress a true match's score."""
     return re.sub(r"\d+", " ", text.lower())
+
+
+def _is_silent_item(item):
+    """Items expected to produce no speech: music, and silent reading."""
+    return item.kind == "music" or item.label in NEVER_SPOKEN_LABELS
 
 
 def _is_anchor_eligible(item):
@@ -173,47 +191,97 @@ def _anchor_items(items, segments):
     }
 
 
-def _gap_candidates(segments, start_time, end_time):
-    """Silences inside (start_time, end_time), as (time, size) pairs.
+class SpeechClock:
+    """Answers 'how many seconds of actual talking fall between a and b?'
 
-    A new section of a service almost always begins after a pause - a new
-    speaker reaching the lectern, the end of a song - so real silences are
-    far better boundary evidence than guessed durations.
+    Used to test whether a proposed window looks like music or like speech.
     """
-    gaps = []
+
+    def __init__(self, segments):
+        self.starts = [s["start"] for s in segments]
+        self.ends = [s["end"] for s in segments]
+        self.cumulative = [0.0]
+        for s in segments:
+            self.cumulative.append(self.cumulative[-1] + max(s["end"] - s["start"], 0))
+
+    def _talk_before(self, t):
+        i = bisect.bisect_right(self.starts, t) - 1
+        if i < 0:
+            return 0.0
+        total = self.cumulative[i]
+        return total + max(min(t, self.ends[i]) - self.starts[i], 0)
+
+    def between(self, a, b):
+        return max(self._talk_before(b) - self._talk_before(a), 0.0)
+
+
+def _boundary_candidates(segments, start_time, end_time, grid_step=0.0):
+    """Times where a section plausibly changes, i.e. either edge of a pause.
+
+    Both edges matter, not just the middle: a hymn's window should be able to
+    start where the talking stops and end where it resumes, hugging the
+    silence rather than straddling it.
+
+    A plain grid is mixed in as well. Pauses alone leave stretches with no
+    boundary at all - a closing hymn after the last spoken word produces no
+    audio and so no pause - and with nowhere to put those items the search is
+    forced to drag everything before them out of position.
+    """
+    found = []
+    if segments and start_time < segments[0]["start"] < end_time:
+        found.append((segments[0]["start"], segments[0]["start"] - start_time))
     for a, b in zip(segments, segments[1:]):
         size = b["start"] - a["end"]
         if size < MIN_GAP_SECONDS:
             continue
-        midpoint = (a["end"] + b["start"]) / 2
-        if start_time < midpoint < end_time:
-            gaps.append((midpoint, size))
-    return gaps
+        for edge in (a["end"], b["start"]):
+            if start_time < edge < end_time:
+                found.append((edge, size))
+    if segments and start_time < segments[-1]["end"] < end_time:
+        found.append((segments[-1]["end"], end_time - segments[-1]["end"]))
+
+    if len(found) > MAX_CANDIDATES:  # keep only the clearest pauses
+        found = sorted(found, key=lambda g: -g[1])[:MAX_CANDIDATES]
+
+    times = {t for t, _ in found}
+    if grid_step > 0:
+        count = min(int((end_time - start_time) / grid_step), MAX_GRID_POINTS)
+        step = (end_time - start_time) / (count + 1) if count > 0 else 0
+        if step > 0:
+            times.update(start_time + step * n for n in range(1, count + 1))
+    return sorted(times)
 
 
-def _duration_cost(duration, prior):
-    """Penalise an item running far longer or shorter than its prior.
+def _window_cost(item, start, end, clock):
+    """How badly a window suits an item, by content type and then by length."""
+    span = max(end - start, 1e-6)
+    talking = clock.between(start, end)
+    wrong = (talking / span) if _is_silent_item(item) else (1.0 - talking / span)
 
-    Log-ratio so being half as long costs the same as being twice as long,
-    rather than short items being effectively free.
+    prior = DURATION_PRIORS.get(item.label, DEFAULT_PRIOR)
+    # log-ratio so half as long costs the same as twice as long, rather than
+    # short items being effectively free
+    length = math.log(max(span, 1.0) / prior) ** 2
+    return TYPE_WEIGHT * wrong + length
+
+
+def _place_items(region_items, start_time, end_time, segments, clock):
+    """Choose windows for consecutive unanchored items across [start, end].
+
+    Minimises total window cost over the candidate boundaries, so music is
+    pushed onto the silences and speech onto the talking, with the duration
+    priors only breaking ties.
     """
-    return math.log(max(duration, 1.0) / prior) ** 2
-
-
-def _cut_at_silences(labels, start_time, end_time, gaps):
-    """Split [start_time, end_time] among len(labels) items, cutting at pauses.
-
-    Chooses the boundaries minimising (duration implausibility - silence
-    reward) over all valid combinations, so a cut lands on a real pause
-    unless doing so would make some item an absurd length.
-    """
-    count = len(labels)
-    priors = [DURATION_PRIORS.get(l, DEFAULT_PRIOR) for l in labels]
+    count = len(region_items)
+    if count == 0:
+        return []
     if count == 1:
         return [(start_time, end_time)]
 
-    needed = count - 1
-    if len(gaps) < needed:  # not enough real pauses - fall back to priors
+    candidates = _boundary_candidates(segments, start_time, end_time, GRID_STEP_SECONDS)
+    times = [start_time] + candidates + [end_time]
+    if len(times) < count + 1:  # not enough distinct pauses - fall back to priors
+        priors = [DURATION_PRIORS.get(i.label, DEFAULT_PRIOR) for i in region_items]
         total = sum(priors) or 1
         span = max(end_time - start_time, 0)
         bounds, t = [], start_time
@@ -222,28 +290,23 @@ def _cut_at_silences(labels, start_time, end_time, gaps):
             t += span * p / total
         return bounds
 
-    # keep the search cheap on long gaps by considering only the clearest pauses
-    if len(gaps) > 60:
-        gaps = sorted(sorted(gaps, key=lambda g: -g[1])[:60])
-    times = [start_time] + [g[0] for g in gaps] + [end_time]
-    rewards = [0.0] + [GAP_REWARD * min(g[1], GAP_SATURATION) / GAP_SATURATION for g in gaps] + [0.0]
     last = len(times) - 1
-
-    # dp[k][j]: best cost with items 0..k placed and item k ending at times[j]
     INF = float("inf")
+    # dp[k][j]: best cost with items 0..k placed and item k ending at times[j]
     dp = [[INF] * len(times) for _ in range(count)]
     back = [[-1] * len(times) for _ in range(count)]
     for j in range(1, len(times)):
-        dp[0][j] = _duration_cost(times[j] - times[0], priors[0]) - rewards[j]
+        dp[0][j] = _window_cost(region_items[0], times[0], times[j], clock)
     for k in range(1, count):
         for j in range(k + 1, len(times)):
+            best, best_i = INF, -1
             for i in range(k, j):
                 if dp[k - 1][i] == INF:
                     continue
-                cost = dp[k - 1][i] + _duration_cost(times[j] - times[i], priors[k]) - rewards[j]
-                if cost < dp[k][j]:
-                    dp[k][j] = cost
-                    back[k][j] = i
+                cost = dp[k - 1][i] + _window_cost(region_items[k], times[i], times[j], clock)
+                if cost < best:
+                    best, best_i = cost, i
+            dp[k][j], back[k][j] = best, best_i
 
     bounds, j = [], last
     for k in range(count - 1, -1, -1):
@@ -253,7 +316,7 @@ def _cut_at_silences(labels, start_time, end_time, gaps):
     return list(reversed(bounds))
 
 
-def _fill_windows(items, anchors, segments, audio_duration):
+def _fill_windows(items, anchors, segments, clock, audio_duration):
     """Return {item_index: (start, end)} for every item, anchored or inferred."""
     windows = {}
     n = len(items)
@@ -272,9 +335,8 @@ def _fill_windows(items, anchors, segments, audio_duration):
             j += 1
         next_start = anchors[j][0] if j < n else audio_duration
 
-        labels = [items[k].label for k in range(i, j)]
-        gaps = _gap_candidates(segments, prev_end, next_start)
-        for k, bounds in zip(range(i, j), _cut_at_silences(labels, prev_end, next_start, gaps)):
+        region = [items[k] for k in range(i, j)]
+        for k, bounds in zip(range(i, j), _place_items(region, prev_end, next_start, segments, clock)):
             windows[k] = bounds
 
         i = j
@@ -283,16 +345,18 @@ def _fill_windows(items, anchors, segments, audio_duration):
     return windows
 
 
-def align(items, segments):
+def align(items, segments, audio_duration=None):
     if not segments:
         return [
             AlignedBlock(kind=item.kind, label=item.label, speaker=item.speaker, title=item.title)
             for item in items
         ]
 
-    audio_duration = segments[-1]["end"]
+    if audio_duration is None:
+        audio_duration = segments[-1]["end"]
+    clock = SpeechClock(segments)
     anchors = _anchor_items(items, segments)
-    windows = _fill_windows(items, anchors, segments, audio_duration)
+    windows = _fill_windows(items, anchors, segments, clock, audio_duration)
 
     blocks = [
         AlignedBlock(
@@ -326,8 +390,15 @@ if __name__ == "__main__":
     from worship_guide import parse_worship_guide
 
     items = parse_worship_guide(sys.argv[1])
-    segments = json.load(open(sys.argv[2], encoding="utf-8")) if len(sys.argv) > 2 else []
-    for block in align(items, segments):
+    segments, duration = [], None
+    if len(sys.argv) > 2:
+        raw = json.load(open(sys.argv[2], encoding="utf-8"))
+        segments = raw["segments"] if isinstance(raw, dict) else raw
+        duration = raw.get("duration") if isinstance(raw, dict) else None
+    for block in align(items, segments, audio_duration=duration):
         mark = "MUSIC " if block.kind == "music" else "SPEECH"
-        preview = block.text[:90] if block.kind == "speech" else block.title
-        print(f"[{mark} {block.start:6.0f}-{block.end:6.0f}] {block.label:24} {block.speaker:24} {preview}")
+        preview = block.text[:70] if block.kind == "speech" else block.title
+        print(
+            f"[{mark} {block.start/60:5.1f}-{block.end/60:5.1f}m] "
+            f"{block.label:24} {block.speaker:22} {preview}"
+        )

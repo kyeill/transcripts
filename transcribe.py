@@ -25,20 +25,28 @@ def _download(audio_url, dest):
 
 
 def transcribe(audio_url, model_size=MODEL_SIZE):
-    """Return a list of {start, end, text} segments, in chronological order."""
+    """Return ({start, end, text} segments in order, total audio seconds).
+
+    The duration matters as much as the segments: a service ends with a sung
+    amen and an instrumental postlude, which produce no transcript at all, so
+    taking the last spoken word as the end of the audio leaves those with
+    nowhere to go and pushes everything before them out of place.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         audio_path = os.path.join(tmp, "service.mp3")
         _download(audio_url, audio_path)
 
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
-        segments, _info = model.transcribe(audio_path, vad_filter=True)
+        segments, info = model.transcribe(audio_path, vad_filter=True)
 
-        return [{"start": s.start, "end": s.end, "text": s.text.strip()} for s in segments]
+        found = [{"start": s.start, "end": s.end, "text": s.text.strip()} for s in segments]
+        return found, info.duration
 
 
 if __name__ == "__main__":
     import sys
     import json
 
-    result = transcribe(sys.argv[1])
-    print(json.dumps(result, indent=2))
+    found, duration = transcribe(sys.argv[1])
+    print(f"{duration:.1f}s of audio, {len(found)} segments")
+    print(json.dumps(found, indent=2))
