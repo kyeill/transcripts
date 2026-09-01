@@ -124,23 +124,46 @@ def _is_anchor_eligible(item):
     return bool(_SCRIPTURE_REF_RE.search(item.title) or _SCRIPTURE_REF_RE.search(item.text))
 
 
-def _best_match(item_text, segments):
+def _best_match(item_text, segment_words):
     """Best contiguous segment range for item_text over the whole transcript.
 
     Searched globally rather than forward-only from the last anchor: a
     forward cursor means one bad match hides every later one behind it.
     Ordering is imposed afterwards by _monotonic_anchors instead.
+
+    Compared word by word rather than character by character. That is both
+    truer - it scores shared wording instead of shared letters - and far
+    cheaper, since a passage is a few hundred words but a few thousand
+    characters, and the comparison grows with the square of that.
     """
-    target = _normalise(item_text)
+    target = _normalise(item_text).split()
+    if not target:
+        return None
+
+    # seq2 is indexed once and reused across every candidate. autojunk would
+    # otherwise discard any word occurring in more than 1% of a long passage,
+    # which for ordinary prose means most of the common ones.
+    matcher = SequenceMatcher(autojunk=False)
+    matcher.set_seq2(target)
+    word_limit = int(len(target) * 1.5) + 1
+
     best = None  # (ratio, i, j)
-    for i in range(len(segments)):
-        text = ""
-        for j in range(i, min(i + MAX_ANCHOR_SPAN, len(segments))):
-            text = (text + " " + segments[j]["text"]).strip()
-            ratio = SequenceMatcher(None, _normalise(text), target).ratio()
-            if best is None or ratio > best[0]:
-                best = (ratio, i, j)
-            if len(text) > len(item_text) * 1.5:
+    for i in range(len(segment_words)):
+        words = []
+        for j in range(i, min(i + MAX_ANCHOR_SPAN, len(segment_words))):
+            words.extend(segment_words[j])
+            # a fresh object every time: set_seq1 short-circuits when handed
+            # the same one, so mutating a list in place would silently keep
+            # scoring the first candidate over and over
+            matcher.set_seq1(tuple(words))
+            # cheap upper bounds first; only pay for the real comparison when
+            # this candidate could actually beat the incumbent
+            if best is None or matcher.real_quick_ratio() > best[0]:
+                if best is None or matcher.quick_ratio() > best[0]:
+                    ratio = matcher.ratio()
+                    if best is None or ratio > best[0]:
+                        best = (ratio, i, j)
+            if len(words) > word_limit:
                 break  # already well past a plausible match length
     return best
 
@@ -180,11 +203,13 @@ def _monotonic_anchors(candidates):
 
 def _anchor_items(items, segments):
     """Return {item_index: (start_time, end_time)} for confidently matched items."""
+    segment_words = [_normalise(s["text"]).split() for s in segments]
+
     candidates = {}
     for idx, item in enumerate(items):
         if not _is_anchor_eligible(item):
             continue
-        match = _best_match(item.text, segments)
+        match = _best_match(item.text, segment_words)
         if match is None or match[0] < MIN_ANCHOR_RATIO:
             continue
         candidates[idx] = match
