@@ -38,10 +38,20 @@ _AMEN = re.compile(r"\bamen\b", re.I)
 SECTION_ENDS = {
     "Invocation": _AMEN,
     "Call to Confession": _AMEN,  # the merged prayer of confession ends it
-    "Scripture reading": re.compile(r"\bword of the Lord\b", re.I),
+    # Only as its own sentence. The reader's closing "The word of the Lord."
+    # is a separate utterance, but the same words can appear inside the passage
+    # being read - Acts 15:35 ends "teaching and preaching the word of the
+    # Lord" - and matching that cuts the reading off in the middle of itself.
+    "Scripture reading": re.compile(r"(?:^|[.!?]\s+)the word of the Lord\b", re.I),
     "Prayer": _AMEN,
     "Sermon": _AMEN,  # the closing prayer, which the guide gives no line of its own
 }
+
+# A section cannot close this soon after it opens. "Amen" is common enough in
+# a service that the sermon would otherwise end on one said in the moments
+# after it starts - a congregation echoing the prayer before it, say - which
+# collapses a 40 minute sermon to a single word.
+SECTION_MIN_SECONDS = {"Sermon": 600}
 
 # spoken right after the closing formula, and belongs with it. The
 # congregation's "thanks be to God" response is never picked up by the
@@ -73,9 +83,10 @@ def apply_section_ends(blocks, segments):
             cursor_time = max(cursor_time, block.end)
             continue
 
+        earliest = cursor_time + SECTION_MIN_SECONDS.get(block.label, 0)
         hit = None
         for si in range(cursor_seg, len(segments)):
-            if segments[si]["end"] <= cursor_time:
+            if segments[si]["end"] <= earliest:
                 continue
             found = pattern.search(segments[si]["text"])
             if found:

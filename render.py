@@ -2,6 +2,8 @@
 from docx import Document
 from docx.shared import Pt
 
+from align import NEVER_SPOKEN_LABELS
+
 
 def render(title, date_str, blocks, out_path):
     doc = Document()
@@ -29,8 +31,12 @@ def render(title, date_str, blocks, out_path):
             sub.italic = True
             sub.font.size = Pt(9)
 
-        body = block.text or "[no speech captured]"
-        doc.add_paragraph(body)
+        if block.text:
+            doc.add_paragraph(block.text)
+        elif block.label not in NEVER_SPOKEN_LABELS:
+            # silence is the point of a silent meditation, so say nothing;
+            # anywhere else an empty section is worth flagging
+            doc.add_paragraph("[no speech captured]")
 
     doc.save(out_path)
 
