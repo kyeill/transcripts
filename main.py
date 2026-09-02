@@ -108,6 +108,58 @@ def apply_section_ends(blocks, segments):
     return blocks
 
 
+READING_LABEL = "Scripture reading"
+INTRO_LOOKBACK_SECONDS = 600
+_INTRO_CONTIGUOUS_GAP = 2.0
+_BOOK_CHAPTER_RE = re.compile(r"\b((?:[1-3]\s)?[A-Z][a-z]+)\.?\s+(\d{1,3})")
+
+
+def pull_reading_introduction(blocks, segments):
+    """Put the reader's announcement of the passage back with the reading.
+
+    The passage is announced before the congregation sings and only read
+    afterwards, so the announcement lands minutes earlier and gets swallowed by
+    the song in between. There is no fixed phrasing to look for - "today's
+    reading", "continuing in Acts" - but whatever the wording it names the
+    book, and the guide already gives the book and chapter. Only the text
+    moves: the block keeps its window, so the song still sits between them in
+    the timeline and still gets its own line.
+    """
+    for block in blocks:
+        if block.label != READING_LABEL or not block.text:
+            continue
+        reference = _BOOK_CHAPTER_RE.search(block.title or "")
+        if not reference:
+            continue
+
+        book, chapter = reference.group(1), reference.group(2)
+        # the book with its chapter is the safer match; the book on its own is
+        # the fallback for "continuing in Acts"
+        for cue in (
+            re.compile(rf"\b{re.escape(book)}\b[^.]{{0,20}}\b{re.escape(chapter)}\b", re.I),
+            re.compile(rf"\b{re.escape(book)}\b", re.I),
+        ):
+            found = [
+                i
+                for i, s in enumerate(segments)
+                if block.start - INTRO_LOOKBACK_SECONDS <= s["start"] < block.start
+                and cue.search(s["text"])
+            ]
+            if not found:
+                continue
+            start = found[-1]  # the announcement immediately before the reading
+            intro = [segments[start]["text"].strip()]
+            for nxt in range(start + 1, len(segments)):
+                if segments[nxt]["start"] >= block.start:
+                    break
+                if segments[nxt]["start"] - segments[nxt - 1]["end"] > _INTRO_CONTIGUOUS_GAP:
+                    break  # the singing starts here; stop before it
+                intro.append(segments[nxt]["text"].strip())
+            block.text = " ".join([*intro, block.text]).strip()
+            break
+    return blocks
+
+
 def _speaking_owner(blocks, bi):
     """The block that text at this position belongs to.
 
@@ -200,6 +252,7 @@ def run(episode_url=None):
     # the following section, and the sermon's own end comes from the closing
     # prayer that follows it
     blocks = apply_section_ends(align(items, segments, audio_duration=audio_duration), segments)
+    blocks = pull_reading_introduction(blocks, segments)
     blocks = through_sermon(blocks)
     print(f"keeping {len(blocks)} sections, through the end of the {LAST_LABEL.lower()}")
 
