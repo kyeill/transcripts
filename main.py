@@ -6,8 +6,10 @@ import tempfile
 from datetime import datetime, timezone
 
 from fetch_episode import episode_assets, latest_episode_url
-from worship_guide import parse_worship_guide
+from worship_guide import label_key, parse_worship_guide
 from align import NEVER_SPOKEN_LABELS, align
+
+_NEVER_SPOKEN = {label_key(l) for l in NEVER_SPOKEN_LABELS}
 from render import render
 
 # transcribe is imported inside run(): it pulls in faster-whisper, which has no
@@ -28,6 +30,7 @@ LAST_LABEL = "Sermon"
 # confession is spoken as part of the confession, so it belongs under that
 # heading rather than getting one of its own.
 MERGED_LABELS = {"Prayer of confession"}
+_MERGED = {label_key(l) for l in MERGED_LABELS}
 
 # This liturgy is scripted, and these sections each finish on a fixed spoken
 # formula. That is far better evidence than anything in the audio: the leader
@@ -46,12 +49,14 @@ SECTION_ENDS = {
     "Prayer": _AMEN,
     "Sermon": _AMEN,  # the closing prayer, which the guide gives no line of its own
 }
+_ENDS = {label_key(k): v for k, v in SECTION_ENDS.items()}
 
 # A section cannot close this soon after it opens. "Amen" is common enough in
 # a service that the sermon would otherwise end on one said in the moments
 # after it starts - a congregation echoing the prayer before it, say - which
 # collapses a 40 minute sermon to a single word.
 SECTION_MIN_SECONDS = {"Sermon": 600}
+_MIN_SECONDS = {label_key(k): v for k, v in SECTION_MIN_SECONDS.items()}
 
 # spoken right after the closing formula, and belongs with it. The
 # congregation's "thanks be to God" response is never picked up by the
@@ -60,12 +65,12 @@ _TRAILING_CUE_RE = re.compile(r"^[\s.,:;\"']*(?:please\s+)?be seated\.?", re.I)
 
 
 def drop_merged_sections(items):
-    return [item for item in items if item.label not in MERGED_LABELS]
+    return [item for item in items if label_key(item.label) not in _MERGED]
 
 
 def through_sermon(blocks):
     for i in range(len(blocks) - 1, -1, -1):
-        if blocks[i].label == LAST_LABEL:
+        if label_key(blocks[i].label) == label_key(LAST_LABEL):
             return blocks[: i + 1]
     return blocks  # no sermon found - keep everything rather than emit nothing
 
@@ -78,12 +83,12 @@ def apply_section_ends(blocks, segments):
     splits = {}  # segment index -> (owning block index, character offset)
     cursor_time, cursor_seg = 0.0, 0
     for bi, block in enumerate(blocks):
-        pattern = SECTION_ENDS.get(block.label) if block.kind == "speech" else None
+        pattern = _ENDS.get(label_key(block.label)) if block.kind == "speech" else None
         if pattern is None:
             cursor_time = max(cursor_time, block.end)
             continue
 
-        earliest = cursor_time + SECTION_MIN_SECONDS.get(block.label, 0)
+        earliest = cursor_time + _MIN_SECONDS.get(label_key(block.label), 0)
         hit = None
         for si in range(cursor_seg, len(segments)):
             if segments[si]["end"] <= earliest:
@@ -127,7 +132,7 @@ def pull_reading_introduction(blocks, segments):
     the timeline and still gets its own line.
     """
     for block in blocks:
-        if block.label != READING_LABEL or not block.text:
+        if label_key(block.label) != label_key(READING_LABEL) or not block.text:
             continue
         reference = _BOOK_CHAPTER_RE.search(block.title or "")
         if not reference:
@@ -166,12 +171,13 @@ def pull_reading_introduction(blocks, segments):
 # of the section's printed text and would otherwise stay with the welcome.
 SPEAKER_INTRO_LABELS = {"Call to Worship"}
 SPEAKER_INTRO_LOOKBACK = 300
+_SPEAKER_INTRO = {label_key(l) for l in SPEAKER_INTRO_LABELS}
 
 
 def _start_at_speaker_introduction(blocks, segments):
     """Move a section's start back to where its reader gives their name."""
     for i, block in enumerate(blocks):
-        if i == 0 or block.label not in SPEAKER_INTRO_LABELS or not block.speaker:
+        if i == 0 or label_key(block.label) not in _SPEAKER_INTRO or not block.speaker:
             continue
         surname = block.speaker.split()[-1]
         if len(surname) < 4:  # too short to be distinctive
@@ -268,7 +274,7 @@ def _speaking_owner(blocks, bi):
     whatever comes next - the elder introducing himself before the call to
     worship, for instance.
     """
-    while bi < len(blocks) - 1 and blocks[bi].label in NEVER_SPOKEN_LABELS:
+    while bi < len(blocks) - 1 and label_key(blocks[bi].label) in _NEVER_SPOKEN:
         bi += 1
     return bi
 
@@ -305,7 +311,7 @@ def _reflow(blocks, segments, splits):
         texts[_segment_owner(blocks, bi, segment)].append(segment["text"])
 
     for block, parts in zip(blocks, texts):
-        keeps_text = block.kind == "speech" and block.label not in NEVER_SPOKEN_LABELS
+        keeps_text = block.kind == "speech" and label_key(block.label) not in _NEVER_SPOKEN
         block.text = " ".join(parts).strip() if keeps_text else ""
 
 

@@ -47,11 +47,23 @@ _LABEL_RE = re.compile(
 # whatever spelling the guide used maps back to the one the rest of the code knows
 _CANONICAL_LABEL = {label.lower(): label for label in _ALL_LABELS}
 
+
+def label_key(label):
+    """Labels are compared case-insensitively throughout.
+
+    The guide's capitalisation drifts week to week, so nothing downstream
+    should key off it. Note this applies to matching *known words* only -
+    where capitalisation is itself the evidence (an ALL-CAPS divider, a
+    person's name, a book of the Bible) the patterns stay case-sensitive
+    deliberately, because lowercasing them would match almost anything.
+    """
+    return (label or "").casefold()
+
 _SECTION_HEADER_RE = re.compile(r"^[A-Z][A-Z’' ,]{6,}$")
 
 # recurring footer boilerplate that isn't part of the order of service
 _BOILERPLATE_RE = re.compile(
-    r"^(Please rise in body|Prayer Partners are available|on your heart:)"
+    r"^(Please rise in body|Prayer Partners are available|on your heart:)", re.I
 )
 
 _WORD = r"[A-Z][A-Za-z'.]*"

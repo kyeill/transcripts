@@ -3,6 +3,9 @@ from docx import Document
 from docx.shared import Pt
 
 from align import NEVER_SPOKEN_LABELS
+from worship_guide import label_key
+
+_NEVER_SPOKEN = {label_key(l) for l in NEVER_SPOKEN_LABELS}
 
 
 def render(title, date_str, blocks, out_path):
@@ -33,7 +36,7 @@ def render(title, date_str, blocks, out_path):
 
         if block.text:
             doc.add_paragraph(block.text)
-        elif block.label not in NEVER_SPOKEN_LABELS:
+        elif label_key(block.label) not in _NEVER_SPOKEN:
             # silence is the point of a silent meditation, so say nothing;
             # anywhere else an empty section is worth flagging
             doc.add_paragraph("[no speech captured]")

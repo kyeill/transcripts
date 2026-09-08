@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
+from worship_guide import label_key
+
 # a body is only anchor-eligible if it's an actual scripture quotation
 # (read verbatim) rather than a bulletin note, sermon outline, or logistics
 # aside - which can be long too, but aren't what gets said word-for-word
@@ -36,6 +38,7 @@ _SCRIPTURE_REF_RE = re.compile(r"\b(?:[1-3]\s?)?[A-Z][a-z]+\.?\s+\d{1,3}\s?:\s?\
 # be a false match: there is no audio for the text to match against, so the
 # fuzzy search just pins whatever nearby speech scores least badly.
 NEVER_SPOKEN_LABELS = {"Silent meditation"}
+_NEVER_SPOKEN = {label_key(l) for l in NEVER_SPOKEN_LABELS}
 
 # rough seconds; only used to keep results plausible where the audio itself
 # doesn't settle the question
@@ -66,6 +69,7 @@ DURATION_PRIORS = {
     "Postlude": 120,
 }
 DEFAULT_PRIOR = 90
+_PRIORS = {label_key(k): v for k, v in DURATION_PRIORS.items()}
 
 MIN_ANCHOR_TEXT_LEN = 30
 # Printed *lyrics* run to hundreds of characters. A short music body is the
@@ -111,12 +115,12 @@ def _normalise(text):
 
 def _is_silent_item(item):
     """Items expected to produce no speech: music, and silent reading."""
-    return item.kind == "music" or item.label in NEVER_SPOKEN_LABELS
+    return item.kind == "music" or label_key(item.label) in _NEVER_SPOKEN
 
 
 def _is_anchor_eligible(item):
     """Only text that is actually performed word-for-word can be an anchor."""
-    if item.label in NEVER_SPOKEN_LABELS:
+    if label_key(item.label) in _NEVER_SPOKEN:
         return False
     if item.kind == "music":
         return len(item.text) >= MIN_MUSIC_ANCHOR_TEXT_LEN
@@ -300,7 +304,7 @@ def _window_cost(item, start, end, clock):
     talking = clock.between(start, end)
     wrong = (talking / span) if _is_silent_item(item) else (1.0 - talking / span)
 
-    prior = DURATION_PRIORS.get(item.label, DEFAULT_PRIOR)
+    prior = _PRIORS.get(label_key(item.label), DEFAULT_PRIOR)
     # log-ratio so half as long costs the same as twice as long, rather than
     # short items being effectively free
     length = math.log(max(span, 1.0) / prior) ** 2
@@ -323,7 +327,7 @@ def _place_items(region_items, start_time, end_time, segments, clock):
     candidates = _boundary_candidates(segments, start_time, end_time, GRID_STEP_SECONDS)
     times = [start_time] + candidates + [end_time]
     if len(times) < count + 1:  # not enough distinct pauses - fall back to priors
-        priors = [DURATION_PRIORS.get(i.label, DEFAULT_PRIOR) for i in region_items]
+        priors = [_PRIORS.get(label_key(i.label), DEFAULT_PRIOR) for i in region_items]
         total = sum(priors) or 1
         span = max(end_time - start_time, 0)
         bounds, t = [], start_time
