@@ -34,9 +34,18 @@ SPEECH_LABELS = [
     "Benediction",
 ]
 
-# longest-label-first so "Prayer of confession" matches before "Prayer"
+# longest-label-first so "Prayer of confession" matches before "Prayer".
+# Matched case-insensitively: the guide's capitalisation drifts week to week
+# ("Call to confession" one Sunday, "Declaration of Forgiveness" another), and
+# a heading that fails to match doesn't just lose its own section - it gets
+# swallowed into the body of the section above it, taking that section's
+# anchor text with it.
 _ALL_LABELS = sorted(MUSIC_LABELS + SPEECH_LABELS, key=len, reverse=True)
-_LABEL_RE = re.compile(r"^(" + "|".join(re.escape(l) for l in _ALL_LABELS) + r")\b\s*(.*)$")
+_LABEL_RE = re.compile(
+    r"^(" + "|".join(re.escape(l) for l in _ALL_LABELS) + r")\b\s*(.*)$", re.I
+)
+# whatever spelling the guide used maps back to the one the rest of the code knows
+_CANONICAL_LABEL = {label.lower(): label for label in _ALL_LABELS}
 
 _SECTION_HEADER_RE = re.compile(r"^[A-Z][A-Z’' ,]{6,}$")
 
@@ -125,7 +134,8 @@ def parse_worship_guide(pdf_path):
         m = _LABEL_RE.match(stripped)
 
         if m:
-            label, remainder = m.group(1), m.group(2).strip()
+            label = _CANONICAL_LABEL[m.group(1).lower()]
+            remainder = m.group(2).strip()
             kind = "music" if label in MUSIC_LABELS else "speech"
             speaker = ""
             if kind == "speech":

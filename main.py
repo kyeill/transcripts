@@ -104,6 +104,7 @@ def apply_section_ends(blocks, segments):
         splits[si] = (bi, offset)
         cursor_time, cursor_seg = block.end, si
 
+    _start_at_speaker_introduction(blocks, segments)
     _reflow(blocks, segments, splits)
     return blocks
 
@@ -160,6 +161,105 @@ def pull_reading_introduction(blocks, segments):
     return blocks
 
 
+# The guide names who leads these, and they introduce themselves before
+# reading ("My name is Dan Churchwell", "I am Brian Burke"), which lands ahead
+# of the section's printed text and would otherwise stay with the welcome.
+SPEAKER_INTRO_LABELS = {"Call to Worship"}
+SPEAKER_INTRO_LOOKBACK = 300
+
+
+def _start_at_speaker_introduction(blocks, segments):
+    """Move a section's start back to where its reader gives their name."""
+    for i, block in enumerate(blocks):
+        if i == 0 or block.label not in SPEAKER_INTRO_LABELS or not block.speaker:
+            continue
+        surname = block.speaker.split()[-1]
+        if len(surname) < 4:  # too short to be distinctive
+            continue
+
+        cue = re.compile(rf"\b{re.escape(surname)}\b", re.I)
+        spoken = [
+            s["start"]
+            for s in segments
+            if block.start - SPEAKER_INTRO_LOOKBACK <= s["start"] < block.start
+            and cue.search(s["text"])
+        ]
+        if not spoken:
+            continue
+        moment = spoken[-1]
+
+        # walk back to whichever block currently holds that moment
+        holder = next(
+            (j for j in range(i - 1, -1, -1) if blocks[j].start <= moment < blocks[j].end),
+            None,
+        )
+        if holder is None or any(b.kind == "music" for b in blocks[holder:i]):
+            continue  # never collapse a song to make room
+        for between in blocks[holder:i]:
+            between.end = min(between.end, moment)
+        block.start = moment
+
+
+# A sung stretch the transcriber ran together with the words on either side:
+# few words spread over minutes. Those words were spoken, not sung.
+MUSIC_SPILLOVER_RATE = 1.0  # words per second, well under a speaking pace
+
+
+def _music_spillover(blocks, segments):
+    """Words trapped inside a music block that open the section after it.
+
+    Music sections carry no text, so anything spoken during one is dropped.
+    Usually that is right. But when the transcriber runs the sung minutes
+    together with the announcement before them and the first words of the next
+    section, the last of those words are that section's opening - a prayer
+    beginning while the closing chord is still ringing - and dropping them
+    loses the start of it.
+    """
+    owners = {}
+    for bi, block in enumerate(blocks[:-1]):
+        if block.kind != "music":
+            continue
+        inside = [
+            si
+            for si, s in enumerate(segments)
+            if block.start <= s["start"] < block.end and s["text"].strip()
+        ]
+        if not inside:
+            continue
+
+        # the sung stretch itself: minutes long, almost no words in it
+        sung = [
+            si
+            for si in inside
+            if segments[si]["end"] > segments[si]["start"]
+            and len(segments[si]["text"].split())
+            / (segments[si]["end"] - segments[si]["start"])
+            < MUSIC_SPILLOVER_RATE
+        ]
+        if not sung:
+            continue  # the singing was transcribed properly; nothing is trapped
+
+        # from the singing onwards the words are the next section starting up
+        for si in inside:
+            if si >= sung[-1]:
+                owners[si] = bi + 1
+    return owners
+
+
+def _segment_owner(blocks, bi, segment):
+    """Whose words these are, when a segment straddles a boundary.
+
+    Singing is dropped by the transcriber, so words inside a music block were
+    spoken rather than sung - and a segment running past the end of that block
+    is the opening of the next section, caught in the same breath as the last
+    announcement. Leaving it with the music throws it away, since music
+    sections carry no text.
+    """
+    if bi < len(blocks) - 1 and blocks[bi].kind == "music" and segment["end"] > blocks[bi].end:
+        bi += 1
+    return _speaking_owner(blocks, bi)
+
+
 def _speaking_owner(blocks, bi):
     """The block that text at this position belongs to.
 
@@ -181,11 +281,15 @@ def _reflow(blocks, segments, splits):
         block.end = max(block.end, previous_end)
         previous_end = block.end
 
+    spillover = _music_spillover(blocks, segments)
     texts = [[] for _ in blocks]
     bi = 0
     for si, segment in enumerate(segments):
         while bi < len(blocks) - 1 and segment["start"] >= blocks[bi].end:
             bi += 1
+        if si in spillover:
+            texts[_speaking_owner(blocks, spillover[si])].append(segment["text"])
+            continue
         if si in splits:
             owner, offset = splits[si]
             head = segment["text"][:offset].strip()
@@ -198,7 +302,7 @@ def _reflow(blocks, segments, splits):
                 texts[_speaking_owner(blocks, owner + 1)].append(tail)
             bi = min(owner + 1, len(blocks) - 1)
             continue
-        texts[_speaking_owner(blocks, bi)].append(segment["text"])
+        texts[_segment_owner(blocks, bi, segment)].append(segment["text"])
 
     for block, parts in zip(blocks, texts):
         keeps_text = block.kind == "speech" and block.label not in NEVER_SPOKEN_LABELS

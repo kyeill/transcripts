@@ -89,6 +89,7 @@ MAX_GRID_POINTS = 240
 # How strongly to insist that music lands on silence and speech on talking.
 # Set well above the duration priors: the priors are guesses, this is measured.
 TYPE_WEIGHT = 6.0
+WORDS_PER_SECOND = 2.5  # ordinary speaking pace, for spotting near-wordless stretches
 
 
 @dataclass
@@ -230,16 +231,27 @@ class SpeechClock:
     def __init__(self, segments):
         self.starts = [s["start"] for s in segments]
         self.ends = [s["end"] for s in segments]
+        self.weights = []
         self.cumulative = [0.0]
         for s in segments:
-            self.cumulative.append(self.cumulative[-1] + max(s["end"] - s["start"], 0))
+            span = max(s["end"] - s["start"], 0)
+            words = len(s["text"].split())
+            # A long stretch carrying only a handful of words is not that many
+            # minutes of talking: it is singing or silence the transcriber
+            # lumped in with the words on either side. Counting it as speech
+            # makes a sung hymn look like a sermon and pushes the section
+            # boundaries around it out of place, so it is discounted to the
+            # time those words would actually take to say.
+            spoken = min(span, words / WORDS_PER_SECOND) if span > 0 else 0.0
+            self.weights.append(spoken / span if span > 0 else 1.0)
+            self.cumulative.append(self.cumulative[-1] + spoken)
 
     def _talk_before(self, t):
         i = bisect.bisect_right(self.starts, t) - 1
         if i < 0:
             return 0.0
-        total = self.cumulative[i]
-        return total + max(min(t, self.ends[i]) - self.starts[i], 0)
+        inside = max(min(t, self.ends[i]) - self.starts[i], 0) * self.weights[i]
+        return self.cumulative[i] + inside
 
     def between(self, a, b):
         return max(self._talk_before(b) - self._talk_before(a), 0.0)
