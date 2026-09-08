@@ -51,5 +51,15 @@ jobs:
             echo "nothing new - already up to date"
           else
             git commit -m "Add transcript [skip ci]"
-            git push
+            # Rebase before pushing. Any commit landing during the run - the
+            # transcription takes the best part of an hour - otherwise gets the
+            # push rejected, and the finished transcript is thrown away with the
+            # runner despite all the work having succeeded.
+            for attempt in 1 2 3; do
+              git pull --rebase --autostash origin master && git push && exit 0
+              echo "push attempt $attempt failed; retrying"
+              sleep 5
+            done
+            echo "could not push the transcript" >&2
+            exit 1
           fi
