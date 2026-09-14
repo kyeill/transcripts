@@ -80,6 +80,18 @@ def apply_section_ends(blocks, segments):
     if not blocks or not segments:
         return blocks
 
+    # A closing formula is not always said. A prayer of confession can end in
+    # silence instead of an "amen", and an unbounded search then runs on to the
+    # next "amen" minutes later and swallows every section in between. Anchored
+    # sections are matched to their own printed text, so their positions can be
+    # trusted: never hunt a terminator past the next one.
+    next_anchor = {}
+    upcoming = None
+    for bi in range(len(blocks) - 1, -1, -1):
+        next_anchor[bi] = upcoming
+        if blocks[bi].anchored:
+            upcoming = blocks[bi].start
+
     splits = {}  # segment index -> (owning block index, character offset)
     cursor_time, cursor_seg = 0.0, 0
     for bi, block in enumerate(blocks):
@@ -89,8 +101,11 @@ def apply_section_ends(blocks, segments):
             continue
 
         earliest = cursor_time + _MIN_SECONDS.get(label_key(block.label), 0)
+        limit = next_anchor.get(bi)
         hit = None
         for si in range(cursor_seg, len(segments)):
+            if limit is not None and segments[si]["start"] >= limit:
+                break  # into the next section we are sure about; it wasn't said
             if segments[si]["end"] <= earliest:
                 continue
             found = pattern.search(segments[si]["text"])

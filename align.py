@@ -105,6 +105,8 @@ class AlignedBlock:
     text: str = ""
     start: float = 0.0
     end: float = 0.0
+    # matched to its own printed text, so this one's position is trustworthy
+    anchored: bool = False
 
 
 def _normalise(text):
@@ -412,6 +414,7 @@ def align(items, segments, audio_duration=None):
             title=item.title,
             start=windows[idx][0],
             end=windows[idx][1],
+            anchored=idx in anchors,
         )
         for idx, item in enumerate(items)
     ]
