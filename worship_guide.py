@@ -66,6 +66,12 @@ _BOILERPLATE_RE = re.compile(
     r"^(Please rise in body|Prayer Partners are available|on your heart:)", re.I
 )
 
+# A per-service logistics note ("8:30 service  On the final verse of the song
+# below, 4- to 5-year-olds are invited...") printed under the declaration of
+# forgiveness. It runs until the next item, and left in, it drowns the verse
+# above it - which then never matches the audio of it being read.
+_SERVICE_NOTE_RE = re.compile(r"^\d{1,2}:\d{2}\s+service\b", re.I)
+
 _WORD = r"[A-Z][A-Za-z'.]*"
 # tried first: a role title anchors the name unambiguously, so it can't
 # swallow trailing words of a sermon/song title that also happen to be
@@ -86,7 +92,8 @@ class ServiceItem:
 
     @property
     def text(self):
-        return " ".join(self.body).strip()
+        # rejoin words the PDF broke across lines ("unrigh- teousness")
+        return re.sub(r"([a-z])- ([a-z])", r"\1\2", " ".join(self.body)).strip()
 
 
 def _extract_pages(pdf_path):
@@ -130,6 +137,7 @@ def parse_worship_guide(pdf_path):
 
     items = []
     current = None
+    in_note = False
 
     for line in lines:
         if line.startswith("Sunday Worship"):
@@ -143,9 +151,14 @@ def parse_worship_guide(pdf_path):
         if _BOILERPLATE_RE.match(stripped):
             continue
 
+        if _SERVICE_NOTE_RE.match(stripped):
+            in_note = True  # everything up to the next item is the note
+            continue
+
         m = _LABEL_RE.match(stripped)
 
         if m:
+            in_note = False
             label = _CANONICAL_LABEL[m.group(1).lower()]
             remainder = m.group(2).strip()
             kind = "music" if label in MUSIC_LABELS else "speech"
@@ -156,9 +169,10 @@ def parse_worship_guide(pdf_path):
             items.append(current)
         elif line.startswith("*"):
             # bare congregational song title, e.g. "* All Creatures of Our God and King  Trinity Hymnal 115"
+            in_note = False
             current = ServiceItem(kind="music", label="Song", title=stripped)
             items.append(current)
-        elif current is not None:
+        elif current is not None and not in_note:
             current.body.append(line)
         # else: stray line before the first recognized item - drop it
 

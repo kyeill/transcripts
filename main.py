@@ -61,7 +61,7 @@ _MIN_SECONDS = {label_key(k): v for k, v in SECTION_MIN_SECONDS.items()}
 # spoken right after the closing formula, and belongs with it. The
 # congregation's "thanks be to God" response is never picked up by the
 # recording, so it can't be used.
-_TRAILING_CUE_RE = re.compile(r"^[\s.,:;\"']*(?:please\s+)?be seated\.?", re.I)
+_TRAILING_CUE_RE = re.compile(r"^[\s.,:;\"']*(?:please\s+|you\s+(?:may|can|will)\s+)?be seated\.?", re.I)
 
 
 def drop_merged_sections(items):
@@ -112,7 +112,15 @@ def apply_section_ends(blocks, segments):
             if found:
                 hit = (si, found.end())
                 break
-        if hit is None:  # never said, or not transcribed - keep the inferred end
+        if hit is None:  # never said, or not transcribed
+            following = blocks[bi + 1] if bi + 1 < len(blocks) else None
+            if following is not None and following.kind == "speech" and following.anchored:
+                # With no closing formula the section runs on until the next
+                # one's printed text is heard. A prayer of confession that ends
+                # in silent confession - with a song sung over the silence -
+                # otherwise gets cut off at its opening words and handed to the
+                # declaration of forgiveness that follows.
+                block.end = max(block.end, following.start)
             cursor_time = max(cursor_time, block.end)
             continue
 
@@ -267,6 +275,49 @@ def _music_spillover(blocks, segments):
     return owners
 
 
+# How close together spoken lines must run to count as one run of speech, and
+# how long a lead-in to a song can last before it is more than a lead-in.
+LEAD_IN_GAP_SECONDS = 3.0
+LEAD_IN_MAX_SECONDS = 45.0
+
+
+def _music_lead_ins(blocks, segments, splits, spillover):
+    """Words said on the way into a song, which belong to the section before.
+
+    "Children are dismissed as we sing this next song... let's rise and sing"
+    runs straight on from the section before it, but it falls inside the
+    song's window and music sections carry no text, so it would be dropped.
+    Sections that end on a spoken formula are left alone: what follows their
+    "amen" is deliberately not theirs.
+    """
+    closed_by_formula = {owner for owner, _ in splits.values()}
+    owners = {}
+    for bi in range(1, len(blocks)):
+        block, before = blocks[bi], blocks[bi - 1]
+        if block.kind != "music" or before.kind != "speech" or bi - 1 in closed_by_formula:
+            continue
+        if label_key(before.label) in _NEVER_SPOKEN:
+            continue
+        previous_end = None
+        for si, segment in enumerate(segments):
+            if segment["start"] < block.start:
+                previous_end = segment["end"] if segment["text"].strip() else previous_end
+                continue
+            if segment["start"] >= block.end or si in spillover or previous_end is None:
+                break
+            duration = segment["end"] - segment["start"]
+            words = len(segment["text"].split())
+            if (
+                segment["start"] - previous_end > LEAD_IN_GAP_SECONDS
+                or segment["end"] - block.start > LEAD_IN_MAX_SECONDS
+                or (duration > 0 and words / duration < MUSIC_SPILLOVER_RATE)
+            ):
+                break  # the singing has started
+            owners[si] = bi - 1
+            previous_end = segment["end"]
+    return owners
+
+
 def _segment_owner(blocks, bi, segment):
     """Whose words these are, when a segment straddles a boundary.
 
@@ -303,6 +354,7 @@ def _reflow(blocks, segments, splits):
         previous_end = block.end
 
     spillover = _music_spillover(blocks, segments)
+    spillover.update(_music_lead_ins(blocks, segments, splits, spillover))
     texts = [[] for _ in blocks]
     bi = 0
     for si, segment in enumerate(segments):
