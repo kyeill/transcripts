@@ -118,6 +118,10 @@ class AlignedBlock:
     end: float = 0.0
     # matched to its own printed text, so this one's position is trustworthy
     anchored: bool = False
+    # the guide printed text for it that ought to have matched
+    anchor_eligible: bool = False
+    # ended on its spoken closing formula ("Amen", "the word of the Lord")
+    closed: bool = False
 
 
 def _normalise(text):
@@ -436,6 +440,7 @@ def align(items, segments, audio_duration=None):
             start=windows[idx][0],
             end=windows[idx][1],
             anchored=idx in anchors,
+            anchor_eligible=_is_anchor_eligible(item),
         )
         for idx, item in enumerate(items)
     ]

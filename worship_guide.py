@@ -96,11 +96,36 @@ class ServiceItem:
     speaker: str = ""
     reference: str = ""
     body: list = field(default_factory=list)
+    # a heading not in the known lists, picked up by how it is styled
+    unfamiliar: bool = False
 
     @property
     def text(self):
         # rejoin words the PDF broke across lines ("unrigh- teousness")
         return re.sub(r"([a-z])- ([a-z])", r"\1\2", " ".join(self.body)).strip()
+
+
+_SMALL_WORDS = {"of", "the", "and", "to", "for", "in", "a", "an", "on", "at", "with"}
+_ROLE_WORDS = re.compile(r"\b(?:Pastor|Elder|Director|Minister|Ministries|Assistant)\b")
+
+
+def looks_like_heading(line):
+    """A guide line styled like a section heading ("Reception of New Members").
+
+    Title Case with at least one small joining word, short, and none of the
+    punctuation or digits that body text, names and scripture carry. Song
+    lyrics are sentence case, so they don't qualify.
+    """
+    words = line.split()
+    if not 2 <= len(words) <= 7 or re.search(r"[\d.,;:!?()@]", line):
+        return False
+    if _ROLE_WORDS.search(line):
+        return False  # a staff title under a name, not a section
+    return (
+        words[0][0].isupper()
+        and all(w in _SMALL_WORDS or w[0].isupper() for w in words)
+        and any(w in _SMALL_WORDS for w in words)
+    )
 
 
 def _extract_pages(pdf_path):
@@ -178,6 +203,18 @@ def parse_worship_guide(pdf_path):
             # bare congregational song title, e.g. "* All Creatures of Our God and King  Trinity Hymnal 115"
             in_note = False
             current = ServiceItem(kind="music", label="Song", title=stripped)
+            items.append(current)
+        elif (
+            current is not None
+            and current.kind == "speech"
+            and label_key(current.label) != "sermon"
+            and looks_like_heading(stripped)
+        ):
+            # An occasional section with a heading not listed above ("Reception
+            # of New Members" before it was added). Left as body text it would
+            # silently merge into the section before; as its own item it gets
+            # its own place in the timeline and a flag for checking.
+            current = ServiceItem(kind="speech", label=stripped, unfamiliar=True)
             items.append(current)
         elif current is not None and not in_note:
             current.body.append(line)

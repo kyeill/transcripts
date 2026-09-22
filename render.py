@@ -8,11 +8,21 @@ from worship_guide import label_key
 _NEVER_SPOKEN = {label_key(l) for l in NEVER_SPOKEN_LABELS}
 
 
-def render(title, date_str, blocks, out_path):
+def render(title, date_str, blocks, out_path, notes=()):
     doc = Document()
 
     doc.add_heading(title, level=0)
     doc.add_paragraph(date_str).italic = True
+
+    # Where the section splits were guesses rather than matches, so a reader
+    # knows which few spots to look at instead of checking everything.
+    p = doc.add_paragraph()
+    p.add_run("Please check").bold = True
+    if notes:
+        for note in notes:
+            doc.add_paragraph(note, style="List Bullet")
+    else:
+        doc.add_paragraph("Nothing flagged - every section matched its guide text or closing words.")
 
     for block in blocks:
         if block.kind == "music":

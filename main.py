@@ -11,6 +11,7 @@ from align import NEVER_SPOKEN_LABELS, align
 
 _NEVER_SPOKEN = {label_key(l) for l in NEVER_SPOKEN_LABELS}
 from render import render
+from review import review_notes
 
 # transcribe is imported inside run(): it pulls in faster-whisper, which has no
 # Windows-ARM64 wheel, and importing it at module level would make this file
@@ -151,6 +152,9 @@ def apply_section_ends(blocks, segments):
                 # what comes after that silence ("Hear now God's declaration of
                 # forgiveness") already belongs to the next section.
                 block.end = max(block.end, _last_long_silence(segments, block.end, following.start))
+                # ended by the next section's matched text instead, which is
+                # as firm as the formula would have been
+                block.closed = True
             cursor_time = max(cursor_time, block.end)
             continue
 
@@ -169,6 +173,7 @@ def apply_section_ends(blocks, segments):
                 offset = len(segments[si]["text"])
         block.end = segments[si]["end"]
         splits[si] = (bi, offset)
+        block.closed = True
         cursor_time, cursor_seg = block.end, si
 
     _start_at_speaker_introduction(blocks, segments)
@@ -499,10 +504,12 @@ def run(episode_url=None):
     blocks = apply_section_ends(align(items, segments, audio_duration=audio_duration), segments)
     blocks = pull_reading_introduction(blocks, segments)
     blocks = through_sermon(blocks)
+    notes = review_notes(items, blocks, segments, set(_ENDS))
+    print(f"{len(notes)} spot(s) flagged for checking")
     print(f"keeping {len(blocks)} sections, through the end of the {LAST_LABEL.lower()}")
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    render(title, date_str, blocks, out_path)
+    render(title, date_str, blocks, out_path, notes)
     print(f"wrote {out_path}")
     return out_path
 
