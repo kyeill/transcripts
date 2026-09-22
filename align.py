@@ -60,6 +60,8 @@ DURATION_PRIORS = {
     # renders as a title, not text. When in doubt, err long.
     "Sermon": 2400,
     "Prayer": 60,
+    "Reception of New Members": 480,
+    "Baptism": 300,
     "Living out our faith": 180,
     "Missionary Greeting": 240,
     "Prayers of the People": 240,
@@ -80,6 +82,15 @@ MIN_MUSIC_ANCHOR_TEXT_LEN = 200
 # A genuinely performed passage scores well above this against its printed
 # text once digits are normalised away.
 MIN_ANCHOR_RATIO = 0.6
+# Read responsively, only the leader's half reliably reaches the recording -
+# the congregation's lines are quieter and often come out garbled or missing -
+# so a true match scores lower than a passage one person reads alone.
+MIN_RESPONSIVE_ANCHOR_RATIO = 0.5
+# The guide marks text said aloud together or in turns ("responsive prayer;
+# congregation reads bold type", "The Lord's Prayer, spoken together"). Unlike
+# a bulletin note, that is performed word for word even with no scripture
+# reference attached.
+_SPOKEN_ALOUD_RE = re.compile(r"respons|together", re.I)
 MAX_ANCHOR_SPAN = 80  # max segments one anchor may span
 
 MIN_GAP_SECONDS = 0.6  # a pause has to be this long to be a boundary candidate
@@ -128,7 +139,17 @@ def _is_anchor_eligible(item):
         return len(item.text) >= MIN_MUSIC_ANCHOR_TEXT_LEN
     if len(item.text) < MIN_ANCHOR_TEXT_LEN:
         return False
-    return bool(_SCRIPTURE_REF_RE.search(item.title) or _SCRIPTURE_REF_RE.search(item.text))
+    return bool(
+        _SCRIPTURE_REF_RE.search(item.title)
+        or _SCRIPTURE_REF_RE.search(item.text)
+        or _SPOKEN_ALOUD_RE.search(item.title)
+    )
+
+
+def _min_ratio(item):
+    if item.kind == "speech" and _SPOKEN_ALOUD_RE.search(item.title):
+        return MIN_RESPONSIVE_ANCHOR_RATIO
+    return MIN_ANCHOR_RATIO
 
 
 def _best_match(item_text, segment_words):
@@ -217,7 +238,7 @@ def _anchor_items(items, segments):
         if not _is_anchor_eligible(item):
             continue
         match = _best_match(item.text, segment_words)
-        if match is None or match[0] < MIN_ANCHOR_RATIO:
+        if match is None or match[0] < _min_ratio(item):
             continue
         candidates[idx] = match
 

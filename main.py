@@ -45,7 +45,11 @@ SECTION_ENDS = {
     # is a separate utterance, but the same words can appear inside the passage
     # being read - Acts 15:35 ends "teaching and preaching the word of the
     # Lord" - and matching that cuts the reading off in the middle of itself.
-    "Scripture reading": re.compile(r"(?:^|[.!?]\s+)the word of the Lord\b", re.I),
+    # "This is the word of the Lord" and "Brothers and sisters, this is the
+    # word of the Lord" are the same close.
+    "Scripture reading": re.compile(
+        r"(?:^|[.!?,]\s+)(?:this is\s+)?the word of the Lord\b", re.I
+    ),
     "Prayer": _AMEN,
     "Sermon": _AMEN,  # the closing prayer, which the guide gives no line of its own
 }
@@ -61,11 +65,33 @@ _MIN_SECONDS = {label_key(k): v for k, v in SECTION_MIN_SECONDS.items()}
 # spoken right after the closing formula, and belongs with it. The
 # congregation's "thanks be to God" response is never picked up by the
 # recording, so it can't be used.
+# The same, when the transcriber gives it lines of its own: the congregation's
+# echoed "Amen." and then "You may be seated." a moment later.
+_TRAILING_LINE_RE = re.compile(
+    r"^\W*(?:amen\W*)?(?:(?:please\s+|you\s+(?:may|can|will)\s+)?be seated)?\W*$", re.I
+)
+_TRAILING_LINE_GAP = 3.0
 _TRAILING_CUE_RE = re.compile(r"^[\s.,:;\"']*(?:please\s+|you\s+(?:may|can|will)\s+)?be seated\.?", re.I)
 
 
 def drop_merged_sections(items):
-    return [item for item in items if label_key(item.label) not in _MERGED]
+    kept = []
+    for item in items:
+        if label_key(item.label) in _MERGED:
+            continue
+        # The guide can print one spoken section as two headings in a row
+        # ("Reception of New Members", then "...and Baptisms"), but it is said
+        # as one continuous stretch with no break to split it at.
+        if (
+            kept
+            and item.kind == "speech"
+            and kept[-1].kind == "speech"
+            and label_key(item.label) == label_key(kept[-1].label)
+        ):
+            kept[-1].body.extend(item.body)
+            continue
+        kept.append(item)
+    return kept
 
 
 def through_sermon(blocks):
@@ -120,7 +146,11 @@ def apply_section_ends(blocks, segments):
                 # in silent confession - with a song sung over the silence -
                 # otherwise gets cut off at its opening words and handed to the
                 # declaration of forgiveness that follows.
-                block.end = max(block.end, following.start)
+                #
+                # A long silence before it is the silent confession itself, and
+                # what comes after that silence ("Hear now God's declaration of
+                # forgiveness") already belongs to the next section.
+                block.end = max(block.end, _last_long_silence(segments, block.end, following.start))
             cursor_time = max(cursor_time, block.end)
             continue
 
@@ -128,6 +158,15 @@ def apply_section_ends(blocks, segments):
         cue = _TRAILING_CUE_RE.match(segments[si]["text"][offset:])
         if cue:
             offset += cue.end()
+        if not segments[si]["text"][offset:].strip(" .,:;!?\"'"):
+            while (
+                si + 1 < len(segments)
+                and segments[si + 1]["text"].strip()
+                and _TRAILING_LINE_RE.match(segments[si + 1]["text"])
+                and segments[si + 1]["start"] - segments[si]["end"] <= _TRAILING_LINE_GAP
+            ):
+                si += 1
+                offset = len(segments[si]["text"])
         block.end = segments[si]["end"]
         splits[si] = (bi, offset)
         cursor_time, cursor_seg = block.end, si
@@ -135,6 +174,18 @@ def apply_section_ends(blocks, segments):
     _start_at_speaker_introduction(blocks, segments)
     _reflow(blocks, segments, splits)
     return blocks
+
+
+SILENCE_SECONDS = 15.0
+
+
+def _last_long_silence(segments, after, before):
+    """Where the last long silence between two moments begins, else `before`."""
+    spoken = [s for s in segments if after <= s["start"] < before and s["text"].strip()]
+    for a, b in reversed(list(zip(spoken, spoken[1:]))):
+        if b["start"] - a["end"] >= SILENCE_SECONDS:
+            return a["end"]
+    return before
 
 
 READING_LABEL = "Scripture reading"
@@ -246,12 +297,21 @@ def _music_spillover(blocks, segments):
     """
     owners = {}
     for bi, block in enumerate(blocks[:-1]):
-        if block.kind != "music":
+        if block.kind != "music" or (bi > 0 and blocks[bi - 1].kind == "music"):
             continue
+        # Songs sung back to back are one stretch of music: the words trapped
+        # in it belong to the first section that is spoken after all of them,
+        # not to the second song, which would throw them away just the same.
+        after = bi + 1
+        while after < len(blocks) and blocks[after].kind == "music":
+            after += 1
+        if after == len(blocks):
+            continue
+        run_end = blocks[after - 1].end
         inside = [
             si
             for si, s in enumerate(segments)
-            if block.start <= s["start"] < block.end and s["text"].strip()
+            if block.start <= s["start"] < run_end and s["text"].strip()
         ]
         if not inside:
             continue
@@ -271,7 +331,7 @@ def _music_spillover(blocks, segments):
         # from the singing onwards the words are the next section starting up
         for si in inside:
             if si >= sung[-1]:
-                owners[si] = bi + 1
+                owners[si] = after
     return owners
 
 

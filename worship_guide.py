@@ -32,6 +32,11 @@ SPEECH_LABELS = [
     "Missionary Greeting",
     "Prayers of the People",
     "Benediction",
+    # an occasional section: new members take their vows before the
+    # congregation, sometimes with baptisms, and it can run ten minutes
+    "Reception of New Members and Baptisms",
+    "Reception of New Members",
+    "Baptism",
 ]
 
 # longest-label-first so "Prayer of confession" matches before "Prayer".
@@ -46,6 +51,8 @@ _LABEL_RE = re.compile(
 )
 # whatever spelling the guide used maps back to the one the rest of the code knows
 _CANONICAL_LABEL = {label.lower(): label for label in _ALL_LABELS}
+# One section under one heading in the document, however the guide splits it.
+_CANONICAL_LABEL["reception of new members and baptisms"] = "Reception of New Members"
 
 
 def label_key(label):
