@@ -49,7 +49,9 @@ DURATION_PRIORS = {
     "Call to Worship": 60,
     "Song": 240,
     "Invocation": 60,
-    "Call to Confession": 30,
+    # the prayer of confession is spoken as part of it, and the silent
+    # confession - often with a song over it - runs on for minutes more
+    "Call to Confession": 180,
     "Prayer of confession": 90,
     "Declaration of forgiveness": 30,
     "Scripture reading": 120,
@@ -239,6 +241,36 @@ def _monotonic_anchors(candidates):
     return {k: candidates[k] for k in chain}
 
 
+# A leader named in the guide introduces themselves as their section begins
+# ("my name is Jim Visser and I serve as an elder here"). That is weaker
+# evidence than matching printed text - hence the lower score - but it is real,
+# and it is often the only thing pinning a section whose reading the
+# transcriber dropped.
+NAME_ANCHOR_RATIO = 0.65
+MAX_NAME_MENTIONS = 3  # more than this and the name isn't marking anything
+
+
+def _name_candidates(items, segments):
+    """Anchors from a leader introducing themselves, as {index: (score, first, last)}."""
+    found = {}
+    for idx, item in enumerate(items):
+        # the preacher is talked about before he speaks ("be with Andrew as he
+        # brings the word"), so his name marks nothing
+        if item.kind != "speech" or not item.speaker or label_key(item.label) == "sermon":
+            continue
+        surname = item.speaker.split()[-1]
+        if len(surname) < 4:
+            continue
+        cue = re.compile(rf"\b{re.escape(surname)}\b", re.I)
+        hits = [si for si, seg in enumerate(segments) if cue.search(seg["text"])]
+        if not hits or len(hits) > MAX_NAME_MENTIONS:
+            continue
+        # just the line the name is in: a name marks a moment, and claiming
+        # the lines after it only makes this candidate collide with the next
+        found[idx] = (NAME_ANCHOR_RATIO, hits[0], hits[0])
+    return found
+
+
 def _anchor_items(items, segments):
     """Return {item_index: (start_time, end_time)} for confidently matched items."""
     segment_words = [_normalise(s["text"]).split() for s in segments]
@@ -252,11 +284,21 @@ def _anchor_items(items, segments):
             continue
         candidates[idx] = match
 
+    names = _name_candidates(items, segments)
+    for idx, candidate in names.items():
+        candidates.setdefault(idx, candidate)  # printed text always wins
+
     kept = _monotonic_anchors(candidates)
-    return {
-        idx: (segments[first]["start"], segments[last]["end"])
-        for idx, (_, first, last) in kept.items()
-    }
+    anchors, starts = {}, {}
+    for idx, (_, first, last) in kept.items():
+        if idx in names and names[idx][1] == first:
+            # a name says where the section STARTS. How long it then runs is
+            # not the name's business - ending it at the introduction leaves
+            # the rest of the section to whatever follows.
+            starts[idx] = segments[first]["start"]
+        else:
+            anchors[idx] = (segments[first]["start"], segments[last]["end"])
+    return anchors, starts
 
 
 class SpeechClock:
@@ -282,15 +324,15 @@ class SpeechClock:
             # makes a sung hymn look like a sermon and pushes the section
             # boundaries around it out of place, so it is discounted to the
             # time those words would actually take to say.
-            spoken = min(span, words / WORDS_PER_SECOND) if span > 0 else 0.0
+            lumped = span >= AMBIGUOUS_MIN_SECONDS and words / max(span, 1e-6) < AMBIGUOUS_RATE
+            # a lumped line says nothing about ANY of its minutes, including
+            # the few its words would fill: where in it they were said is
+            # exactly what has been lost
+            spoken = 0.0 if lumped else (min(span, words / WORDS_PER_SECOND) if span > 0 else 0.0)
             self.weights.append(spoken / span if span > 0 else 1.0)
             self.cumulative.append(self.cumulative[-1] + spoken)
-            blind = (
-                span - spoken
-                if span >= AMBIGUOUS_MIN_SECONDS and words / span < AMBIGUOUS_RATE
-                else 0.0
-            )
-            self.blind_weights.append(blind / span if span > 0 else 0.0)
+            blind = span if lumped else 0.0
+            self.blind_weights.append(1.0 if lumped else 0.0)
             self.blind_cumulative.append(self.blind_cumulative[-1] + blind)
 
     def _before(self, t, weights, cumulative):
@@ -315,6 +357,16 @@ class SpeechClock:
             - self._before(a, self.blind_weights, self.blind_cumulative),
             0.0,
         )
+
+
+def _lumped_spans(segments):
+    """Lines where singing and speech were run together (see SpeechClock)."""
+    spans = []
+    for s in segments:
+        span = s["end"] - s["start"]
+        if span >= AMBIGUOUS_MIN_SECONDS and len(s["text"].split()) / max(span, 1e-6) < AMBIGUOUS_RATE:
+            spans.append((s["start"], s["end"]))
+    return spans
 
 
 def _boundary_candidates(segments, start_time, end_time, grid_step=0.0):
@@ -346,22 +398,33 @@ def _boundary_candidates(segments, start_time, end_time, grid_step=0.0):
         found = sorted(found, key=lambda g: -g[1])[:MAX_CANDIDATES]
 
     times = {t for t, _ in found}
+    # A section can change where a lumped line begins or ends, but not part
+    # way through one: inside it nothing says where one thing stopped and the
+    # next started, and a split there decides who gets those words by chance.
+    lumped = _lumped_spans(segments)
+    for a, b in lumped:
+        for edge in (a, b):
+            if start_time < edge < end_time:
+                times.add(edge)
     if grid_step > 0:
         count = min(int((end_time - start_time) / grid_step), MAX_GRID_POINTS)
         step = (end_time - start_time) / (count + 1) if count > 0 else 0
         if step > 0:
             times.update(start_time + step * n for n in range(1, count + 1))
-    return sorted(times)
+    return sorted(t for t in times if not any(a < t < b for a, b in lumped))
 
 
 def _window_cost(item, start, end, clock):
     """How badly a window suits an item, by content type and then by length."""
     span = max(end - start, 1e-6)
     talking = clock.between(start, end)
-    # judge only the part of the window that says something either way
-    known = max(span - clock.blind_between(start, end), 1e-6)
-    share = min(talking / known, 1.0)
-    wrong = share if _is_silent_item(item) else (1.0 - share)
+    blind = clock.blind_between(start, end)
+    known = max(span - blind, 0.0)
+    # Time that says nothing counts half wrong for everything. Treating it as
+    # free instead invites the search to park short sections inside it, where
+    # nothing can contradict them.
+    off_type = (talking if _is_silent_item(item) else max(known - talking, 0.0)) + blind / 2
+    wrong = off_type / span
 
     prior = _PRIORS.get(label_key(item.label), DEFAULT_PRIOR)
     # log-ratio so half as long costs the same as twice as long, rather than
@@ -421,31 +484,38 @@ def _place_items(region_items, start_time, end_time, segments, clock):
     return list(reversed(bounds))
 
 
-def _fill_windows(items, anchors, segments, clock, audio_duration):
+def _fill_windows(items, anchors, segments, clock, audio_duration, starts=None):
     """Return {item_index: (start, end)} for every item, anchored or inferred."""
     windows = {}
+    starts = starts or {}
     n = len(items)
     i = 0
     prev_end = 0.0
 
     while i < n:
+        if i in starts:
+            # pinned start, free end: it opens the next stretch of guesswork
+            prev_end = starts[i]
         if i in anchors:
             windows[i] = anchors[i]
             prev_end = anchors[i][1]
             i += 1
             continue
 
-        j = i
-        while j < n and j not in anchors:
+        j = i + 1
+        while j < n and j not in anchors and j not in starts:
             j += 1
-        next_start = anchors[j][0] if j < n else audio_duration
+        if j >= n:
+            next_start = audio_duration
+        else:
+            next_start = anchors[j][0] if j in anchors else starts[j]
 
         region = [items[k] for k in range(i, j)]
         for k, bounds in zip(range(i, j), _place_items(region, prev_end, next_start, segments, clock)):
             windows[k] = bounds
 
         i = j
-        prev_end = next_start
+        prev_end = min(next_start, windows[j - 1][1]) if j < n else next_start
 
     return windows
 
@@ -460,8 +530,8 @@ def align(items, segments, audio_duration=None):
     if audio_duration is None:
         audio_duration = segments[-1]["end"]
     clock = SpeechClock(segments)
-    anchors = _anchor_items(items, segments)
-    windows = _fill_windows(items, anchors, segments, clock, audio_duration)
+    anchors, starts = _anchor_items(items, segments)
+    windows = _fill_windows(items, anchors, segments, clock, audio_duration, starts)
 
     blocks = [
         AlignedBlock(

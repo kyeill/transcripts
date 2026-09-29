@@ -139,6 +139,15 @@ def apply_section_ends(blocks, segments):
             if found:
                 hit = (si, found.end())
                 break
+            # the phrase can straddle two lines ("...This is the" / "word of
+            # our Lord. Please pray with me."), which neither line shows alone
+            if si + 1 < len(segments):
+                head = segments[si]["text"]
+                joined = f"{head} {segments[si + 1]['text']}"
+                found = pattern.search(joined)
+                if found and found.end() > len(head):
+                    hit = (si + 1, found.end() - len(head) - 1)
+                    break
         if hit is None:  # never said, or not transcribed
             following = blocks[bi + 1] if bi + 1 < len(blocks) else None
             if following is not None and following.kind == "speech" and following.anchored:
