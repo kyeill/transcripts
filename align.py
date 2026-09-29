@@ -105,6 +105,12 @@ MAX_GRID_POINTS = 240
 # Set well above the duration priors: the priors are guesses, this is measured.
 TYPE_WEIGHT = 6.0
 WORDS_PER_SECOND = 2.5  # ordinary speaking pace, for spotting near-wordless stretches
+# A minutes-long stretch carrying a handful of words is the transcriber running
+# singing together with the talking on either side of it. It is not evidence of
+# silence and not evidence of speech - it is no evidence at all, and counting it
+# as silence drags songs over the speech beside them.
+AMBIGUOUS_MIN_SECONDS = 45.0
+AMBIGUOUS_RATE = 1.0  # words per second
 
 
 @dataclass
@@ -264,6 +270,9 @@ class SpeechClock:
         self.ends = [s["end"] for s in segments]
         self.weights = []
         self.cumulative = [0.0]
+        # seconds that say nothing either way (see AMBIGUOUS_MIN_SECONDS)
+        self.blind_weights = []
+        self.blind_cumulative = [0.0]
         for s in segments:
             span = max(s["end"] - s["start"], 0)
             words = len(s["text"].split())
@@ -276,16 +285,36 @@ class SpeechClock:
             spoken = min(span, words / WORDS_PER_SECOND) if span > 0 else 0.0
             self.weights.append(spoken / span if span > 0 else 1.0)
             self.cumulative.append(self.cumulative[-1] + spoken)
+            blind = (
+                span - spoken
+                if span >= AMBIGUOUS_MIN_SECONDS and words / span < AMBIGUOUS_RATE
+                else 0.0
+            )
+            self.blind_weights.append(blind / span if span > 0 else 0.0)
+            self.blind_cumulative.append(self.blind_cumulative[-1] + blind)
 
-    def _talk_before(self, t):
+    def _before(self, t, weights, cumulative):
         i = bisect.bisect_right(self.starts, t) - 1
         if i < 0:
             return 0.0
-        inside = max(min(t, self.ends[i]) - self.starts[i], 0) * self.weights[i]
-        return self.cumulative[i] + inside
+        inside = max(min(t, self.ends[i]) - self.starts[i], 0) * weights[i]
+        return cumulative[i] + inside
 
     def between(self, a, b):
-        return max(self._talk_before(b) - self._talk_before(a), 0.0)
+        """Seconds of real talking between two moments."""
+        return max(
+            self._before(b, self.weights, self.cumulative)
+            - self._before(a, self.weights, self.cumulative),
+            0.0,
+        )
+
+    def blind_between(self, a, b):
+        """Seconds that are neither talking nor usable silence."""
+        return max(
+            self._before(b, self.blind_weights, self.blind_cumulative)
+            - self._before(a, self.blind_weights, self.blind_cumulative),
+            0.0,
+        )
 
 
 def _boundary_candidates(segments, start_time, end_time, grid_step=0.0):
@@ -329,7 +358,10 @@ def _window_cost(item, start, end, clock):
     """How badly a window suits an item, by content type and then by length."""
     span = max(end - start, 1e-6)
     talking = clock.between(start, end)
-    wrong = (talking / span) if _is_silent_item(item) else (1.0 - talking / span)
+    # judge only the part of the window that says something either way
+    known = max(span - clock.blind_between(start, end), 1e-6)
+    share = min(talking / known, 1.0)
+    wrong = share if _is_silent_item(item) else (1.0 - share)
 
     prior = _PRIORS.get(label_key(item.label), DEFAULT_PRIOR)
     # log-ratio so half as long costs the same as twice as long, rather than

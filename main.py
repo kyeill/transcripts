@@ -49,7 +49,7 @@ SECTION_ENDS = {
     # "This is the word of the Lord" and "Brothers and sisters, this is the
     # word of the Lord" are the same close.
     "Scripture reading": re.compile(
-        r"(?:^|[.!?,]\s+)(?:this is\s+)?the word of the Lord\b", re.I
+        r"(?:^|[.!?,]\s+)(?:this is\s+)?the word of (?:the|our) Lord\b", re.I
     ),
     "Prayer": _AMEN,
     "Sermon": _AMEN,  # the closing prayer, which the guide gives no line of its own
@@ -176,7 +176,7 @@ def apply_section_ends(blocks, segments):
         block.closed = True
         cursor_time, cursor_seg = block.end, si
 
-    _start_at_speaker_introduction(blocks, segments)
+    _start_at_speaker_introduction(blocks, segments, splits)
     _reflow(blocks, segments, splits)
     return blocks
 
@@ -250,11 +250,32 @@ def pull_reading_introduction(blocks, segments):
 # of the section's printed text and would otherwise stay with the welcome.
 SPEAKER_INTRO_LABELS = {"Call to Worship"}
 SPEAKER_INTRO_LOOKBACK = 300
+# the boundary can land before the introduction when the transcriber lumps it
+# in with the music before it, so look a little past the section's start too
+SPEAKER_INTRO_LOOKAHEAD = 90
 _SPEAKER_INTRO = {label_key(l) for l in SPEAKER_INTRO_LABELS}
 
 
-def _start_at_speaker_introduction(blocks, segments):
-    """Move a section's start back to where its reader gives their name."""
+def _is_lumped(segment):
+    """A line where the transcriber ran minutes of singing in with the words."""
+    span = segment["end"] - segment["start"]
+    return span >= 45.0 and len(segment["text"].split()) / max(span, 1e-6) < 1.0
+
+
+def _sentence_start(text, position):
+    """Where the sentence containing `position` begins."""
+    breaks = [m.end() for m in re.finditer(r"[.!?]\s+", text[:position])]
+    return breaks[-1] if breaks else 0
+
+
+def _start_at_speaker_introduction(blocks, segments, splits):
+    """Start a section where its reader gives their name.
+
+    The introduction ("my name is Jim Visser and I serve as an elder here")
+    runs straight on from whatever came before it, often inside the same
+    transcribed line, so the section is started mid-line when that is where
+    the sentence begins.
+    """
     for i, block in enumerate(blocks):
         if i == 0 or label_key(block.label) not in _SPEAKER_INTRO or not block.speaker:
             continue
@@ -263,15 +284,38 @@ def _start_at_speaker_introduction(blocks, segments):
             continue
 
         cue = re.compile(rf"\b{re.escape(surname)}\b", re.I)
-        spoken = [
-            s["start"]
-            for s in segments
-            if block.start - SPEAKER_INTRO_LOOKBACK <= s["start"] < block.start
+        window = [
+            si
+            for si, s in enumerate(segments)
+            if block.start - SPEAKER_INTRO_LOOKBACK <= s["start"]
+            < block.start + SPEAKER_INTRO_LOOKAHEAD
             and cue.search(s["text"])
         ]
-        if not spoken:
+        if not window:
             continue
-        moment = spoken[-1]
+        # the last introduction before the section, or the first one just
+        # after it when the boundary landed early
+        before = [si for si in window if segments[si]["start"] < block.start]
+        si = before[-1] if before else window[0]
+
+        # back up to the start of the sentence the name is in; it can begin in
+        # the line before, which the transcriber ran together with the singing
+        offset = _sentence_start(segments[si]["text"], cue.search(segments[si]["text"]).start())
+        while (
+            offset == 0
+            and si > 0
+            and segments[si]["start"] - segments[si - 1]["end"] <= _INTRO_CONTIGUOUS_GAP
+            # only into a lumped stretch: an ordinary line before this one is a
+            # sentence of its own, and the introduction simply starts here
+            and _is_lumped(segments[si - 1])
+        ):
+            si -= 1
+            offset = _sentence_start(segments[si]["text"], len(segments[si]["text"]))
+
+        moment = segments[si]["start"]
+        if offset:  # part-way through the line
+            share = offset / max(len(segments[si]["text"]), 1)
+            moment += share * (segments[si]["end"] - segments[si]["start"])
 
         # walk back to whichever block currently holds that moment
         holder = next(
@@ -280,6 +324,8 @@ def _start_at_speaker_introduction(blocks, segments):
         )
         if holder is None or any(b.kind == "music" for b in blocks[holder:i]):
             continue  # never collapse a song to make room
+        if offset and si not in splits and holder == i - 1:
+            splits[si] = (holder, offset)
         for between in blocks[holder:i]:
             between.end = min(between.end, moment)
         block.start = moment
