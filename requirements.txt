@@ -3,3 +3,9 @@ requests
 pypdf
 python-docx
 faster-whisper
+# PyAV 19 dropped an argument faster-whisper still passes when it opens the
+# audio ("open() got an unexpected keyword argument 'metadata_errors'"), so
+# every transcription died at the first second. faster-whisper 1.2.1 is its
+# own latest release, so there is no newer version to move to: hold PyAV back
+# until faster-whisper catches up.
+av<19
