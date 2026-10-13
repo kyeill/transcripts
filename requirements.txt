@@ -1,11 +1,18 @@
-playwright
-requests
-pypdf
-python-docx
-faster-whisper
-# PyAV 19 dropped an argument faster-whisper still passes when it opens the
-# audio ("open() got an unexpected keyword argument 'metadata_errors'"), so
-# every transcription died at the first second. faster-whisper 1.2.1 is its
-# own latest release, so there is no newer version to move to: hold PyAV back
-# until faster-whisper catches up.
-av<19
+# Pinned to the exact versions of a run that transcribed a whole service
+# (2026-10-11). Unpinned, an upstream release can break the Sunday run with no
+# change here at all: PyAV 19 dropped an argument faster-whisper still passes,
+# and every transcription died a second into the audio. To move forward, bump
+# these deliberately and watch a run that actually transcribes - a run that
+# only finds nothing to do still passes.
+playwright==1.63.0
+requests==2.34.2
+pypdf==6.20.0
+python-docx==1.2.0
+faster-whisper==1.2.1
+# faster-whisper's own stack, pinned for the same reason
+av==18.1.0
+ctranslate2==4.8.2
+onnxruntime==1.31.0
+tokenizers==0.23.3
+huggingface-hub==2.2.0
+numpy==2.5.4

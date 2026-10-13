@@ -69,7 +69,7 @@ _MIN_SECONDS = {label_key(k): v for k, v in SECTION_MIN_SECONDS.items()}
 # The same, when the transcriber gives it lines of its own: the congregation's
 # echoed "Amen." and then "You may be seated." a moment later.
 _TRAILING_LINE_RE = re.compile(
-    r"^\W*(?:amen\W*)?(?:(?:please\s+|you\s+(?:may|can|will)\s+)?be seated)?\W*$", re.I
+    r"^\W*(?:amen\W*)+(?:(?:please\s+|you\s+(?:may|can|will)\s+)?be seated\W*)?", re.I
 )
 _TRAILING_LINE_GAP = 3.0
 _TRAILING_CUE_RE = re.compile(r"^[\s.,:;\"']*(?:please\s+|you\s+(?:may|can|will)\s+)?be seated\.?", re.I)
@@ -171,15 +171,21 @@ def apply_section_ends(blocks, segments):
         cue = _TRAILING_CUE_RE.match(segments[si]["text"][offset:])
         if cue:
             offset += cue.end()
-        if not segments[si]["text"][offset:].strip(" .,:;!?\"'"):
-            while (
-                si + 1 < len(segments)
-                and segments[si + 1]["text"].strip()
-                and _TRAILING_LINE_RE.match(segments[si + 1]["text"])
-                and segments[si + 1]["start"] - segments[si]["end"] <= _TRAILING_LINE_GAP
-            ):
-                si += 1
-                offset = len(segments[si]["text"])
+        # The congregation echoes the "Amen", and the leader's "you may be
+        # seated" follows it, often at the head of the line that then opens the
+        # next section. All of that closes this section rather than opening the
+        # next one.
+        while (
+            not segments[si]["text"][offset:].strip(" .,:;!?\"'")
+            and si + 1 < len(segments)
+            and segments[si + 1]["text"].strip()
+            and segments[si + 1]["start"] - segments[si]["end"] <= _TRAILING_LINE_GAP
+        ):
+            echo = _TRAILING_LINE_RE.match(segments[si + 1]["text"])
+            if not echo:
+                break
+            si += 1
+            offset = echo.end()
         block.end = segments[si]["end"]
         splits[si] = (bi, offset)
         block.closed = True
@@ -346,22 +352,24 @@ MUSIC_SPILLOVER_RATE = 1.0  # words per second, well under a speaking pace
 
 
 def _music_spillover(blocks, segments):
-    """Words trapped inside a music block that open the section after it.
+    """Words trapped inside a music window, handed to the sections they open.
 
     Music sections carry no text, so anything spoken during one is dropped.
-    Usually that is right. But when the transcriber runs the sung minutes
-    together with the announcement before them and the first words of the next
-    section, the last of those words are that section's opening - a prayer
-    beginning while the closing chord is still ringing - and dropping them
-    loses the start of it.
+    Usually that is right. But the transcriber runs the sung minutes together
+    with the words that follow them, and those words are the next section
+    starting up - a prayer beginning while the closing chord is still ringing.
+
+    A single music window can hold more than one of these. The guide may print
+    one song where the service sang two with a prayer in between; then the
+    words after the first sung stretch open the next section and the words
+    after the second open the one after that, in order.
     """
     owners = {}
     for bi, block in enumerate(blocks[:-1]):
         if block.kind != "music" or (bi > 0 and blocks[bi - 1].kind == "music"):
             continue
-        # Songs sung back to back are one stretch of music: the words trapped
-        # in it belong to the first section that is spoken after all of them,
-        # not to the second song, which would throw them away just the same.
+        # Songs sung back to back are one stretch of music: no section of the
+        # document sits between them to receive anything.
         after = bi + 1
         while after < len(blocks) and blocks[after].kind == "music":
             after += 1
@@ -376,29 +384,82 @@ def _music_spillover(blocks, segments):
         if not inside:
             continue
 
-        # the sung stretch itself: minutes long, almost no words in it
-        sung = [
-            si
-            for si in inside
-            if segments[si]["end"] > segments[si]["start"]
-            and len(segments[si]["text"].split())
-            / (segments[si]["end"] - segments[si]["start"])
-            < MUSIC_SPILLOVER_RATE
-        ]
-        if not sung:
+        # Lines the transcriber did catch of the singing itself, which it
+        # writes out at an ordinary pace: a chorus comes round again, so a
+        # line repeated inside one song is being sung, not spoken.
+        seen, sung_again = set(), set()
+        for si in inside:
+            key = " ".join(segments[si]["text"].lower().split())
+            if key in seen:
+                sung_again.add(key)
+            seen.add(key)
+
+        # each sung stretch - minutes long, almost no words in it - opens a
+        # group of words that belong to whatever is spoken next
+        groups = []
+        for si in inside:
+            if _is_sung(segments[si]):
+                groups.append([si])
+            elif groups:
+                key = " ".join(segments[si]["text"].lower().split())
+                if key in sung_again:
+                    continue  # a repeated line: the song, not the next section
+                groups[-1].append(si)
+        if not groups:
             continue  # the singing was transcribed properly; nothing is trapped
 
-        # from the singing onwards the words are the next section starting up
-        for si in inside:
-            if si >= sung[-1]:
-                owners[si] = after
+        targets = _receiving_blocks(blocks, after, len(groups))
+
+        # The last group runs on past the song into the section that receives
+        # it, so follow it there - but no further than that section: those
+        # words are one stretch of speech, the ones after it are not.
+        last = groups[-1][-1]
+        limit = blocks[targets[-1]].end
+        while (
+            last + 1 < len(segments)
+            and segments[last + 1]["text"].strip()
+            and segments[last + 1]["start"] < limit
+            and segments[last + 1]["start"] - segments[last]["end"] <= LEAD_IN_GAP_SECONDS
+        ):
+            last += 1
+            groups[-1].append(last)
+
+        for group, target in zip(groups, targets):
+            for si in group:
+                owners[si] = target
     return owners
+
+
+def _is_sung(segment):
+    span = segment["end"] - segment["start"]
+    return span > 0 and len(segment["text"].split()) / span < MUSIC_SPILLOVER_RATE
+
+
+def _receiving_blocks(blocks, start, wanted):
+    """The sections after a song that can take words trapped inside it.
+
+    Never past a section matched to its own printed text: that one is where it
+    says it is, and anything spoken before it belongs to something earlier.
+    """
+    found = []
+    for bi in range(start, len(blocks)):
+        if blocks[bi].kind != "speech" or label_key(blocks[bi].label) in _NEVER_SPOKEN:
+            continue
+        found.append(bi)
+        if blocks[bi].anchored or len(found) >= wanted:
+            break
+    while len(found) < wanted:  # more stretches than sections: the last takes them
+        found.append(found[-1])
+    return found
 
 
 # How close together spoken lines must run to count as one run of speech, and
 # how long a lead-in to a song can last before it is more than a lead-in.
 LEAD_IN_GAP_SECONDS = 3.0
-LEAD_IN_MAX_SECONDS = 45.0
+# Generous, because the real guard is the speaking pace below it: singing
+# comes out slower and stops the run at once. A reader can add a passage the
+# guide never printed, and that can run for minutes.
+LEAD_IN_MAX_SECONDS = 150.0
 
 
 def _music_lead_ins(blocks, segments, splits, spillover):
@@ -480,9 +541,11 @@ def _reflow(blocks, segments, splits):
     for si, segment in enumerate(segments):
         while bi < len(blocks) - 1 and segment["start"] >= blocks[bi].end:
             bi += 1
-        if si in spillover:
+        if si in spillover and si not in splits:
             texts[_speaking_owner(blocks, spillover[si])].append(segment["text"])
             continue
+        # a line cut at a closing formula is split where the words say, which
+        # is firmer than any guess about which side of a song it fell on
         if si in splits:
             owner, offset = splits[si]
             head = segment["text"][:offset].strip()

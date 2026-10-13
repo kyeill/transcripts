@@ -7,7 +7,12 @@ on:
     # not wall-clock time, so a late run just means a later transcript,
     # never a duplicate or a skipped week)
     - cron: "0 10,14,18,22,2,6 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "episode URL to rebuild (blank = the latest service)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -32,7 +37,7 @@ jobs:
       - run: pip install -r requirements.txt
       - run: playwright install --with-deps chromium
 
-      - run: python main.py
+      - run: python main.py ${{ inputs.url && format('--url {0}', inputs.url) || '' }}
 
       - name: keep the raw transcript for offline alignment tuning
         if: always()
