@@ -134,23 +134,46 @@ def _extract_pages(pdf_path):
 
 
 def _order_of_service_lines(pages):
-    """Lines from the 'Sunday Worship' page through the musician credits."""
-    started = False
+    """Lines from the page the order of service starts on, through the credits."""
+    start = _first_order_page(pages)
+    if start is None:
+        return []
     lines = []
-    for page_text in pages:
-        if not started:
-            if "Sunday Worship" in page_text:
-                started = True
-            else:
-                continue
+    for page_text in pages[start:]:
         for raw in page_text.splitlines():
             line = raw.strip()
-            if not line:
-                continue
-            lines.append(line)
+            if line:
+                lines.append(line)
         if "Worship musician" in page_text:
             break
     return lines
+
+
+# Enough known headings on one page to be the order of service rather than an
+# announcement that happens to mention a prayer or a welcome.
+LABELS_PER_ORDER_PAGE = 3
+
+
+def _first_order_page(pages):
+    """Which page the order of service starts on.
+
+    Ordinarily it is headed "Sunday Worship". It is not always: All Saints'
+    Day 2026 was headed "All Saints' Day Worship" and nothing matched, which
+    produced a guide with no items in it at all. So when that heading is
+    missing, find the page by what is printed on it instead.
+    """
+    for i, page_text in enumerate(pages):
+        if "Sunday Worship" in page_text:
+            return i
+    for i, page_text in enumerate(pages):
+        labels = {
+            _LABEL_RE.match(line.lstrip("*").strip()).group(1).lower()
+            for line in page_text.splitlines()
+            if _LABEL_RE.match(line.lstrip("*").strip())
+        }
+        if len(labels) >= LABELS_PER_ORDER_PAGE:
+            return i
+    return None
 
 
 def _split_name_and_reference(remainder):

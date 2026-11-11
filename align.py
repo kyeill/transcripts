@@ -128,6 +128,8 @@ class AlignedBlock:
     anchored: bool = False
     # the guide printed text for it that ought to have matched
     anchor_eligible: bool = False
+    # that printed text, kept so a later pass can look for it again
+    text_printed: str = ""
     # ended on its spoken closing formula ("Amen", "the word of the Lord")
     closed: bool = False
 
@@ -543,6 +545,7 @@ def align(items, segments, audio_duration=None):
             end=windows[idx][1],
             anchored=idx in anchors,
             anchor_eligible=_is_anchor_eligible(item),
+            text_printed=item.text,
         )
         for idx, item in enumerate(items)
     ]

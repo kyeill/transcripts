@@ -3,11 +3,18 @@ import json
 import os
 import re
 import tempfile
+from difflib import SequenceMatcher
 from datetime import datetime, timezone
 
 from fetch_episode import episode_assets, latest_service
 from worship_guide import label_key, parse_worship_guide
-from align import NEVER_SPOKEN_LABELS, align
+from align import (
+    AMBIGUOUS_MIN_SECONDS,
+    AMBIGUOUS_RATE,
+    NEVER_SPOKEN_LABELS,
+    _normalise,
+    align,
+)
 
 _NEVER_SPOKEN = {label_key(l) for l in NEVER_SPOKEN_LABELS}
 from render import render
@@ -73,6 +80,35 @@ _TRAILING_LINE_RE = re.compile(
 )
 _TRAILING_LINE_GAP = 3.0
 _TRAILING_CUE_RE = re.compile(r"^[\s.,:;\"']*(?:please\s+|you\s+(?:may|can|will)\s+)?be seated\.?", re.I)
+
+
+# How many of the guide's printed passages have to be heard in the recording
+# for it to be this service at all.
+MIN_MATCHED_PASSAGES = 1
+MIN_PASSAGES_TO_JUDGE = 3
+
+
+def check_recording_matches_guide(blocks, audio_url):
+    """Stop if the audio posted this week is not the service the guide describes.
+
+    It has happened twice that the church posted the wrong file - one week a
+    class recording, another the previous Sunday's service - and both were
+    replaced a few days later. A transcript built from the wrong audio is
+    worse than none: it reads plausibly and it satisfies the "already done"
+    check, so the corrected recording is never picked up. Failing instead
+    leaves the episode untranscribed, and the job retries every few hours.
+
+    Several passages are printed in the guide and read aloud word for word, so
+    a recording of this service always matches some of them.
+    """
+    printed = [b for b in blocks if b.anchor_eligible]
+    matched = sum(1 for b in printed if b.anchored)
+    if len(printed) >= MIN_PASSAGES_TO_JUDGE and matched < MIN_MATCHED_PASSAGES:
+        raise RuntimeError(
+            f"none of the {len(printed)} passages printed in the worship guide are "
+            f"read anywhere in {audio_url} - this looks like the wrong recording, "
+            f"so no transcript was written"
+        )
 
 
 def drop_merged_sections(items):
@@ -394,21 +430,33 @@ def _music_spillover(blocks, segments):
                 sung_again.add(key)
             seen.add(key)
 
-        # each sung stretch - minutes long, almost no words in it - opens a
-        # group of words that belong to whatever is spoken next
+        # Each sung stretch - minutes long, almost no words in it - divides
+        # the words around it into groups. A stretch's own few words are the
+        # start of the speech that follows it, so they open that group.
         groups = []
         for si in inside:
             if _is_sung(segments[si]):
                 groups.append([si])
-            elif groups:
-                key = " ".join(segments[si]["text"].lower().split())
-                if key in sung_again:
-                    continue  # a repeated line: the song, not the next section
+                continue
+            key = " ".join(segments[si]["text"].lower().split())
+            if groups and key in sung_again:
+                continue  # a repeated line: the song, not what was spoken
+            if groups:  # words before any singing are the way in, not a group
                 groups[-1].append(si)
         if not groups:
             continue  # the singing was transcribed properly; nothing is trapped
 
-        targets = _receiving_blocks(blocks, after, len(groups))
+        # The section before the song may not have finished speaking when the
+        # music started - the transcriber runs the singing in with the words
+        # on either side of it either way. The guide settles it: if its
+        # printed passage is read somewhere in here, it is still speaking, and
+        # it takes the first group.
+        before = blocks[bi - 1] if bi else None
+        takes_first = _reads_its_own_passage(before, groups[0], segments)
+        targets = [bi - 1] if takes_first else []
+        targets += _receiving_blocks(blocks, after, max(len(groups) - len(targets), 1))
+        while len(targets) < len(groups):
+            targets.append(targets[-1])
 
         # The last group runs on past the song into the section that receives
         # it, so follow it there - but no further than that section: those
@@ -430,9 +478,39 @@ def _music_spillover(blocks, segments):
     return owners
 
 
+# How much of a section's printed passage has to turn up in the words trapped
+# inside a song for those words to be that section still reading it. Measured
+# in words actually shared, because the transcriber often swallows the rest of
+# the passage into the singing - on 2026-11-08 barely half of Psalm 66 came
+# through, which is far too little to match the printed text as a whole but
+# far more than any coincidence.
+PASSAGE_WORDS_SHARED = 25
+PASSAGE_SHARE = 0.25
+
+
+def _reads_its_own_passage(block, group, segments):
+    """Is this stretch of words the printed passage of the section before?"""
+    if block is None or block.kind != "speech" or block.anchored:
+        return False
+    if not block.anchor_eligible or not block.text_printed:
+        return False
+    printed = _normalise(block.text_printed).split()
+    spoken = _normalise(" ".join(segments[si]["text"] for si in group)).split()
+    if not printed or not spoken:
+        return False
+    matcher = SequenceMatcher(None, printed, spoken, autojunk=False)
+    shared = sum(block_.size for block_ in matcher.get_matching_blocks())
+    return shared >= PASSAGE_WORDS_SHARED and shared >= PASSAGE_SHARE * len(printed)
+
+
 def _is_sung(segment):
+    """A stretch of singing: minutes long, with almost no words in it.
+
+    Long, because a short line at a slow pace is just a slow line - and
+    splitting on one of those cut a reader's own passage in half.
+    """
     span = segment["end"] - segment["start"]
-    return span > 0 and len(segment["text"].split()) / span < MUSIC_SPILLOVER_RATE
+    return span >= AMBIGUOUS_MIN_SECONDS and len(segment["text"].split()) / max(span, 1e-6) < AMBIGUOUS_RATE
 
 
 def _receiving_blocks(blocks, start, wanted):
@@ -455,7 +533,7 @@ def _receiving_blocks(blocks, start, wanted):
 
 # How close together spoken lines must run to count as one run of speech, and
 # how long a lead-in to a song can last before it is more than a lead-in.
-LEAD_IN_GAP_SECONDS = 3.0
+LEAD_IN_GAP_SECONDS = 5.0
 # Generous, because the real guard is the speaking pace below it: singing
 # comes out slower and stops the run at once. A reader can add a passage the
 # guide never printed, and that can run for minutes.
@@ -486,17 +564,26 @@ def _music_lead_ins(blocks, segments, splits, spillover):
                 continue
             if segment["start"] >= block.end or si in spillover or previous_end is None:
                 break
-            duration = segment["end"] - segment["start"]
-            words = len(segment["text"].split())
             if (
                 segment["start"] - previous_end > LEAD_IN_GAP_SECONDS
                 or segment["end"] - block.start > LEAD_IN_MAX_SECONDS
-                or (duration > 0 and words / duration < MUSIC_SPILLOVER_RATE)
+                or _sounds_like_singing(segment)
             ):
                 break  # the singing has started
             owners[si] = bi - 1
             previous_end = segment["end"]
     return owners
+
+
+# A line has to be this long before a slow pace means singing rather than a
+# short line said slowly: a lone "Amen." runs at a crawl and used to end the
+# lead-in there, losing the announcement that followed it.
+SUNG_LINE_SECONDS = 15.0
+
+
+def _sounds_like_singing(segment):
+    span = segment["end"] - segment["start"]
+    return span >= SUNG_LINE_SECONDS and len(segment["text"].split()) / max(span, 1e-6) < MUSIC_SPILLOVER_RATE
 
 
 def _segment_owner(blocks, bi, segment):
@@ -600,6 +687,14 @@ def run(episode_url=None):
         items = drop_merged_sections(parse_worship_guide(pdf_path))
 
     print(f"parsed {len(items)} order-of-service items")
+    if not items:
+        # Writing the document anyway produces an empty one, and because the
+        # job skips an episode that already has a document, that empty file
+        # would stand as this week's transcript for good. Fail instead: the
+        # run is retried every few hours, and nothing is left behind.
+        raise RuntimeError(
+            f"could not read the order of service from {pdf_url} - no transcript written"
+        )
 
     from transcribe import transcribe
 
@@ -619,7 +714,9 @@ def run(episode_url=None):
     # section ends first, on the whole service: the cuts hand trailing words to
     # the following section, and the sermon's own end comes from the closing
     # prayer that follows it
-    blocks = apply_section_ends(align(items, segments, audio_duration=audio_duration), segments)
+    blocks = align(items, segments, audio_duration=audio_duration)
+    check_recording_matches_guide(blocks, audio_url)
+    blocks = apply_section_ends(blocks, segments)
     blocks = pull_reading_introduction(blocks, segments)
     blocks = through_sermon(blocks)
     notes = review_notes(items, blocks, segments, set(_ENDS))
