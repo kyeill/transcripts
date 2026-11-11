@@ -35,7 +35,17 @@ jobs:
           python-version: "3.12"
 
       - run: pip install -r requirements.txt
-      - run: playwright install --with-deps chromium
+      # The runner occasionally cannot reach Ubuntu's package mirrors, which
+      # fails this step and the whole week's transcript with it. Give it a
+      # couple of tries before giving up.
+      - name: install the browser the sermons page needs
+        run: |
+          for attempt in 1 2 3; do
+            playwright install --with-deps chromium && exit 0
+            echo "browser install attempt $attempt failed; retrying"
+            sleep 30
+          done
+          exit 1
 
       - run: python main.py ${{ inputs.url && format('--url {0}', inputs.url) || '' }}
 
