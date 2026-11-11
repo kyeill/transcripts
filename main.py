@@ -291,6 +291,10 @@ def pull_reading_introduction(blocks, segments):
                 if segments[nxt]["start"] - segments[nxt - 1]["end"] > _INTRO_CONTIGUOUS_GAP:
                     break  # the singing starts here; stop before it
                 intro.append(segments[nxt]["text"].strip())
+            # the announcement may already have reached this section - words
+            # trapped in the song before it are handed here too - and adding
+            # it again prints it twice
+            intro = [line for line in intro if line and line not in block.text]
             block.text = " ".join([*intro, block.text]).strip()
             break
     return blocks
