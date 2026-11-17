@@ -17,7 +17,6 @@ from align import (
 )
 
 _NEVER_SPOKEN = {label_key(l) for l in NEVER_SPOKEN_LABELS}
-from render import render
 from review import review_notes
 
 # transcribe is imported inside run(): it pulls in faster-whisper, which has no
@@ -109,6 +108,88 @@ def check_recording_matches_guide(blocks, audio_url):
             f"read anywhere in {audio_url} - this looks like the wrong recording, "
             f"so no transcript was written"
         )
+
+
+# The transcriber sometimes sticks: it writes one line again and again, six
+# copies inside half a second, or repeats a phrase within a single line. None
+# of it was said twice, and left alone it reaches the document word for word -
+# and skews the pace of speech the alignment reads the service by.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _same_words(a, b):
+    strip = lambda t: re.sub(r"[^a-z0-9 ]", "", t.lower()).strip()
+    return strip(a) == strip(b) and bool(strip(a))
+
+
+# Nobody speaks this fast. A line this quick is the transcriber stuttering -
+# but only when it is also repeating words from the lines around it, because
+# a recording with sloppy timings can carry real speech at an absurd rate too.
+IMPOSSIBLE_WORDS_PER_SECOND = 8.0
+STUTTER_NEIGHBOURS = 2
+STUTTER_SHARE = 0.8
+
+
+def _bare(text):
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", text.lower()).split())
+
+
+def _is_stutter(segment, neighbours):
+    span = segment["end"] - segment["start"]
+    words = len(segment["text"].split())
+    if span <= 0 or words / span <= IMPOSSIBLE_WORDS_PER_SECOND:
+        return False
+    said = _bare(segment["text"]).split()
+    around = " ".join(_bare(n["text"]) for n in neighbours).split()
+    if not said or not around:
+        return False
+    # Nearly all of it was said in the lines around it - not necessarily in
+    # the same order, since the stutter rearranges what it rattles off.
+    matcher = SequenceMatcher(None, said, around, autojunk=False)
+    shared = sum(block.size for block in matcher.get_matching_blocks())
+    return shared >= STUTTER_SHARE * len(said)
+
+
+def collapse_repeats(segments):
+    """Drop lines the transcriber repeated, keeping the time they span.
+
+    It sticks in two ways: the same line written out again and again, six
+    copies inside half a second, and a burst that rattles off words from the
+    lines on either side of it far faster than anyone could say them.
+    """
+    kept = []
+    for i, segment in enumerate(segments):
+        if kept and _same_words(kept[-1]["text"], segment["text"]):
+            kept[-1]["end"] = max(kept[-1]["end"], segment["end"])
+            continue
+        around = kept[-STUTTER_NEIGHBOURS:] + segments[i + 1 : i + 1 + STUTTER_NEIGHBOURS]
+        if kept and _is_stutter(segment, around):
+            kept[-1]["end"] = max(kept[-1]["end"], segment["end"])
+            continue
+        kept.append(dict(segment))
+    return kept
+
+
+REPEAT_WINDOW = 3
+
+
+def without_repeated_sentences(text):
+    """Collapse a sentence said again immediately, within a line or across two."""
+    out = []
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        # within a sentence or two, not just back to back: the stutter often
+        # drops a fragment of the line before it in between the two copies
+        if any(_same_words(earlier, sentence) for earlier in out[-REPEAT_WINDOW:]):
+            continue
+        out.append(sentence)
+    return " ".join(out).strip()
+
+
+def tidy(blocks):
+    for block in blocks:
+        if block.text:
+            block.text = without_repeated_sentences(block.text)
+    return blocks
 
 
 def drop_merged_sections(items):
@@ -703,7 +784,12 @@ def run(episode_url=None):
     from transcribe import transcribe
 
     segments, audio_duration = transcribe(audio_url)
-    print(f"transcribed {len(segments)} segments across {audio_duration / 60:.1f} min")
+    spoken = collapse_repeats(segments)
+    print(
+        f"transcribed {len(segments)} segments across {audio_duration / 60:.1f} min"
+        f" ({len(segments) - len(spoken)} repeated lines dropped)"
+    )
+    segments = spoken
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     # Diagnostic dump of the raw timestamped transcript. Transcription is the
@@ -722,10 +808,15 @@ def run(episode_url=None):
     check_recording_matches_guide(blocks, audio_url)
     blocks = apply_section_ends(blocks, segments)
     blocks = pull_reading_introduction(blocks, segments)
-    blocks = through_sermon(blocks)
+    blocks = tidy(through_sermon(blocks))
     notes = review_notes(items, blocks, segments, set(_ENDS))
     print(f"{len(notes)} spot(s) flagged for checking")
     print(f"keeping {len(blocks)} sections, through the end of the {LAST_LABEL.lower()}")
+
+    # imported here for the same reason as transcribe: python-docx needs lxml,
+    # which Kyle's machine blocks, and a module-level import would make this
+    # file unusable there even for the parts that write no document
+    from render import render
 
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     render(title, date_str, blocks, out_path, notes)
